@@ -262,10 +262,10 @@ voice:
   enabled: true
   base_url: https://dashscope.aliyuncs.com/api/v1
   api_key_env: DASHSCOPE_API_KEY
-  # P0 冻结下来的音色身份：设计一次（那是掷骰子，见历史TTS计划 §2.17），
-  # 运行时只用这一个，不再重新设计。synth 模型必须与设计时的 target_model 一致。
+  # 音色身份：由你在供应商侧设计/选定一次，然后固定写在这里，运行时不再重新设计。
+  # synth 模型必须与设计时用的 target_model 一致。下面这个值必须换成你自己的。
   model: qwen3-tts-vd-2026-01-26
-  voice_id: qwen-tts-vd-qichi_cast2-voice-20260914182133631-9160
+  voice_id: REPLACE_WITH_YOUR_OWN_VOICE_ID
   # 单段上限：超过就退回文字，不截断（§2.35）。
   max_chars_per_utterance: 120
   synthesize_timeout_seconds: 12

@@ -718,7 +718,9 @@ Write-StartLog "entry"
 
 $napRoot = if ([string]::IsNullOrWhiteSpace($NapCatRoot)) { $env:QICHI_NAPCAT_ROOT } else { $NapCatRoot }
 if ([string]::IsNullOrWhiteSpace($napRoot)) {
-    $napRoot = "E:\NapCatQQ"
+    # No machine specific fallback on purpose: guessing wrong would launch an
+    # unrelated gateway.  Fail closed and say exactly what is missing.
+    Stop-Production "QICHI_NAPCAT_ROOT is not set (pass -NapCatRoot or set the environment variable)"
 }
 try {
     $napRoot = (Resolve-Path $napRoot -ErrorAction Stop).Path
@@ -731,11 +733,6 @@ $qqExeValue = if (-not [string]::IsNullOrWhiteSpace($QQExecutable)) {
     $QQExecutable
 } elseif (-not [string]::IsNullOrWhiteSpace($env:QICHI_QQ_EXE)) {
     $env:QICHI_QQ_EXE
-} elseif (Test-Path -LiteralPath "E:\QQ\QQ.exe" -PathType Leaf) {
-    # The QQ binary in the NapCat bundle retains the machine install root in
-    # its bootstrap metadata.  Use the explicit installed binary while still
-    # keeping the NapCat hook and the requested profile under the isolated root.
-    "E:\QQ\QQ.exe"
 } else {
     Join-Path $napRoot "qq\QQ.exe"
 }

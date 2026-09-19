@@ -587,7 +587,7 @@ def test_voice_refuses_an_inline_api_key(tmp_path, complete_environment):
 
 def test_voice_enabled_without_a_frozen_voice_is_refused(tmp_path, complete_environment):
     path = enable_voice(tmp_path, {
-        "  voice_id: qwen-tts-vd-qichi_cast2-voice-20260914182133631-9160": "  voice_id: \"\"",
+        "  voice_id: REPLACE_WITH_YOUR_OWN_VOICE_ID": "  voice_id: \"\"",
     })
     env = {**complete_environment, "DASHSCOPE_API_KEY": "secret"}
 
