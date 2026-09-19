@@ -1,0 +1,11 @@
+{
+  "post_type": "message_sent",
+  "message_type": "private",
+  "self_id": "20001",
+  "user_id": 20001,
+  "target_id": 10001,
+  "sender": {"user_id": 20001, "nickname": "sanitized-bot"},
+  "message_id": "30002",
+  "time": 1787803201,
+  "message": [{"type": "text", "data": {"text": "收到啦"}}]
+}

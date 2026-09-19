@@ -1,0 +1,287 @@
+# 引擎运行配置示例。密钥只从环境变量读取。
+app:
+  timezone: Asia/Shanghai
+  owner_qq_env: QICHI_OWNER_QQ
+
+transport:
+  adapter: napcat_onebot11
+  websocket_url_env: NAPCAT_WS_URL
+  http_url_env: NAPCAT_HTTP_URL
+  access_token_env: NAPCAT_ACCESS_TOKEN
+  owner_private_only: true
+  persist_before_process: true
+  quote_context: true
+  quote_resolution:
+    local_first: true
+    fetch_missing_with_get_msg: true
+    persist_resolved_snapshot: true
+    include_inbound_and_outbound_links: true
+    unresolved_must_be_explicit: true
+  local_chat_history:
+    enabled: true
+    preserve_original_text: true
+    preserve_message_segments: true
+    retention_days: null
+
+storage:
+  # 首版统一事务域；事件、引用、outbox、记忆证据和 cursor 不拆库。
+  database_path: data/qichi.sqlite3
+
+llm:
+  provider: deepseek
+  base_url: https://api.deepseek.com/v1
+  api_key_env: DEEPSEEK_API_KEY
+  # 2026-09-16：主模型从 pro 切回 flash（用户裁定「全换 f 吧，p 的开销还是高」）。
+  # 支持这次切换的实测（同一段真脚本 25 轮副本，历史诊断）：
+  # flash（默认含思考）均 31 字、长说明句 2%、最高频骨架只 ×3、每轮 6.0 秒；
+  # 同条件 pro 关思考是均 56 字、29%、×6、2.4 秒。
+  # 反面同样记在案：flash 更爱点名重复（三臂 4 次 vs pro 1 次；09-13 消息占比 39% vs 13%），
+  # 因此这次切换带着判据走，见历史方案。
+  # 09-13 的机制结论仍然成立，也是当初换 pro 的原因：思考 ≈「注意到重复」的能力——
+  # flash 会用它点名对方，pro 关掉思考后没有这个能力就复读自己（41%），
+  # pro 开思考既不复读也不点名，但每轮 27 秒。
+  # 回滚：model 改回 deepseek-v4-pro、thinking 改回 disabled，启动参数带
+  # --evidence runtime/deepseek-v4-pro-capability.json，重启即可。
+  primary:
+    # 官方 API 的精确模型 ID；上下文能力仍由独立 evidence 文件校验。
+    model: deepseek-v4-flash
+    # 对话是否让模型思考：default（不传该参数，交给供应商）/ enabled / disabled。
+    # 2026-09-16 起是 default：flash 默认就含思考，且它思考很快——09-13 的对照里
+    # 关掉思考会把「自己复读」推高到 41%，没有关的理由。
+    thinking: default
+    # Lower sampling variance keeps V4F's hidden reasoning from turning a
+    # short QQ exchange into literary or template-like prose.
+    temperature: 0.5
+    top_p: 0.92
+    # V4 Flash spends hidden reasoning and visible text from this shared
+    # completion budget. The visible reply ceiling is enforced separately.
+    # 2026-09-11 实测（最近 60 轮）：completion 最高 3789，其中隐藏推理 3265，已贴到 4096
+    # 上限；预算不足的实测后果是「推理吃光预算、可见正文 0 字」，故提到 6144。
+    max_output_tokens: 6144
+    max_visible_output_tokens: 1200
+    # 6144 token ÷ 实测最差吞吐（约 200 token/s）≈ 31 秒；25 秒会把长思考轮直接掐断。
+    # 2026-09-14：40 -> 90。主动开口那一轮现在开思考，实测生成 23~56 秒，
+    # 40 秒会把尾部长的那几次掐掉（实测出现过 LLMTimeoutError）。代价：热路径上真的
+    # 卡住时，失败通知从 40 秒变成 90 秒才出。改回 40 即回退。
+    timeout_seconds: 90
+    required_min_context_tokens: 262144
+  # 只在这一轮带图时改用它；None/省略 = 不分流。
+  # 2026-09-16 起主模型也是 flash，这一行与「不分流」等价；保留它是因为视觉能力边界
+  # 仍按 vision_model 判定（pro 没有视觉），将来主模型若换回 pro，它立刻重新生效。
+  vision_model: deepseek-v4-flash
+  # 后台（记忆抽取、明细/时间线 pass）用的模型：用户要求 pro 只用于「实际发出去的消息」，
+  # 后台不许跟着涨价。
+  background_model: deepseek-v4-flash
+  normal_reply_calls: 1
+
+persona:
+  # 运行时角色核心：整条对话热路径唯一注入的角色文本；其它文档永远不会被注入。
+  # 仓库只带一份通用示例。请复制成你自己的文件（例如 doc/我的角色.md）再改；
+  # 路径必须落在项目根目录内。缺失或非法时装配直接失败，不会退回默认人设。
+  system_prompt_file: doc/运行时角色核心.example.md
+  # 下面三项是历史配置键，当前引擎不读取，保留只为兼容既有配置文件。
+  reference_files: []
+  inject_reference_files_verbatim: false
+  prompt_mode: thin
+
+dialogue:
+  # 当前运行 profile 为 256K；实际输入只装已有且有用的内容，不填充凑数。
+  # 512K 仍需未来独立完成供应商能力验证后再开放。
+  context_window_preferred_tokens: 262144
+  context_window_max_tokens: 262144
+  # 必须覆盖 llm.primary.max_output_tokens（校验会拒绝更小的值）；相对 256K 窗口可忽略。
+  output_reserve_tokens: 6144
+  # 这是每轮注入的近期连续原文预算，不是模型上下文上限；完整历史仍保留在 SQLite。
+  recent_history_budget_tokens: 16384
+  require_provider_context_support: true
+  context_strategy: raw_history_first
+  adaptive_expansion: false
+  pin_current_input: true
+  pin_quoted_target: true
+  pin_active_relationship_state: true
+  merge_window_ms: 700
+  merge_window_max_ms: 2200
+  per_conversation_serial: true
+  natural_pause_ms: 0
+  structural_retry_limit: 1
+  llm_decides_reply_target: true
+  # 用户本轮使用 QQ 原生引用时，保留同一目标作为默认原生回复；
+  # 模型仍可通过有效句柄选择另一条相关消息，普通消息不会自动引用。
+  auto_quote_current_message: true
+
+expression:
+  unicode_emoji:
+    enabled: true
+    selection: model_native
+  qq_face:
+    # G2 owner canary and a verified semantic catalog are required before enabling.
+    enabled: false
+    selection: same_generation_intent
+    runtime_catalog: data/qq-expression-catalog.json
+  message_reaction:
+    # Keep native reactions off until the real target/message contract is canaried.
+    enabled: false
+    selection: same_generation_intent
+    idempotent_set: true
+  custom_sticker:
+    enabled: false
+  # Standalone control lines may be placed before, between, or after body text.
+  # `trailing_control_token` remains accepted as a legacy input alias.
+  intent_protocol: standalone_control_line
+  max_native_actions_per_turn: 1
+  random_frequency: false
+  fixed_turn_interval: false
+  replace_text_reply: false
+  persist_action_metadata: true
+
+memory:
+  write_candidates_async: true
+  require_source_quote: true
+  require_source_message_id: true
+  require_source_actor: true
+  include_evidence_in_context: true
+  # 明确持续成立的偏好/约定/纠正，以及双方明确接受且有截止时间的短期约定可自动激活；
+  # 当前场景的命令、角色扮演、玩笑、猜测、单方提议和临时状态不得作为 active 关系事实。
+  auto_commit: verified_explicit
+  # Every valid active memory is visible each turn in one compact, ranked
+  # background index. Agreements and corrections additionally keep their full
+  # evidence-backed relationship-state blocks; lexical retrieval only expands
+  # detailed evidence for the current topic.
+  always_include_types: [agreement, correction]
+  retrieval_candidate_top_k: 24
+  episodic_top_k: 12
+  lifecycle_states: [candidate, active, superseded, rejected, expired]
+  correction_precedence: true
+  ambiguity_stays_candidate: true
+  extraction_mode: async_session_consolidation_v2
+  extraction_idle_minutes: 30
+  extractor_must_reference_event_ids: true
+  uncertain_as_fact: false
+  generated_text_as_user_evidence: false
+  recent_history_from_raw_events: true
+
+boundary:
+  inject_dynamic_capability_manifest: true
+  label_all_fact_sources: true
+  distinguish_past_from_current: true
+  distinguish_user_fact_from_assistant_history: true
+  unavailable_capabilities_are_explicit: true
+  llm_owns_semantic_expression: true
+
+decision_authority:
+  llm:
+    - reply_content
+    - tone_and_length
+    - relationship_expression
+    - memory_relevance
+    - optional_quote_target
+    - emoji_and_qq_expression
+    - initiative_topic_or_skip
+  code:
+    - exact_message_identity
+    - quote_resolution
+    - fact_provenance
+    - current_time
+    - available_platform_capabilities
+    - persistence_order
+    - idempotency_and_delivery_state
+    - privacy_and_owner_scope
+
+initiative:
+  enabled: true
+  # 用户每次发言都会重新计时；每 60 分钟是一次模型可跳过的尝试，不是强制发送。
+  idle_attempt_minutes: 60
+  # Stop competing for attention after this many successful initiative sends
+  # without a new owner message. A new owner message resets the sequence.
+  max_unanswered_attempts: 2
+  reset_on_user_message: true
+  use_same_dialogue_engine: true
+  allow_model_to_skip: true
+  # 每日上限尚未设置；主动消息在北京时间 23:00（含）到次日 08:00（不含）静默。
+  daily_send_limit: null
+  quiet_hours_local: "23:00-08:00"
+  cancel_if_conversation_changed: true
+  unknown_delivery_retry: false
+  # 2026-09-14 用户裁定：只有这一路显式开思考。关思考的 pro 不做「打出来还是说出来」这种
+  # 元决策（实测 0/11 次选用语音），开思考 4/4 次会主动发声；主动开口不占他等回复的时间。
+  # 2026-09-16 起主模型是 flash 且它默认就思考，于是这里写 default（不传参）——与对话同档，
+  # 也不再向 flash 发那个只在 pro 上实测过的显式开关。改回 disabled 即回退。
+  thinking: default
+
+vision:
+  # 识图总开关。关闭时与 2026-09-11 之前完全一致：只标记「收到图片段，不含视觉结果」。
+  # 2026-09-11 晚用户裁定打开：V2 接线完成、副本端到端验收通过（账本 VISION-V2C-REPLAY）。
+  # 关闭它即可回到「看不到图」，无需回退代码。
+  enabled: true
+  # 每轮最多处理几张；超出的只报「另有 N 张未展开」。
+  max_images_per_turn: 2
+  # 单张上限与下载超时；超限或超时一律当作「没看到」，不得猜测内容。
+  # 取图优先用 NapCat get_image 的本地 file（同机回环，通常不到 1 秒），失败再退回 url；
+  # 下载在用户等待的关键路径上，超时不重试（软失败，重试只是把等待翻倍）。
+  max_image_bytes: 5242880
+  download_timeout_seconds: 10
+  # 原图保留（用户 2026-09-11 裁定）：上限 200 MB / 90 天。超期清理只删文件，
+  # 事件与识别信息不动；清理是独立动作，不随对话热路径运行。
+  keep_original_images: true
+  max_total_media_bytes: 209715200
+  max_media_age_days: 90
+
+net:
+  # 外部检索（V4）。**默认关闭**：关着时不建客户端、不声明工具，行为与今天逐字一致。
+  # 2026-09-13 用户裁定：后端用 Tavily；不主动查（主动消息里不给工具）；
+  # 带图轮不查——她必须先问「要不要我去查」，对方同意后才在下一轮查；
+  # 识图「稳定两周」的前置由用户当场豁免。
+  # 还需要两个 key：TAVILY_API_KEY（文本，Tavily 免费档 1,000 credits/月）与
+  # SERPAPI_API_KEY（图搜，免费档 1,000 次/月）。两个都在用户环境里。
+  # 2026-09-14 打开：桩验收通过（闲聊零工具、要求查时查一次且识破提示注入、
+  # 新图轮调不到工具、宽限轮用本地存档图真查）。回滚就是这一行改回 false + 重启。
+  enabled: true
+  base_url: https://api.tavily.com
+  api_key_env: TAVILY_API_KEY
+  # 单次检索超时。它在用户等待的关键路径上，超时不重试（软失败，重试只是把等待翻倍）。
+  timeout_seconds: 8
+  # 单轮最多几条结果，以及所有结果正文的总字数上限（防止上下文膨胀）。
+  max_results: 3
+  max_chars: 1200
+  # basic / advanced / fast：basic 是延迟与相关性的平衡点。
+  search_depth: basic
+  # 以图搜图（甲，2026-09-13 用户裁定）：另一家供应商、另一个 key。
+  # 图只经过这一家——文本检索那家永远看不到照片。实测流程：
+  #   POST /image（multipart）换 image_id → GET /search?engine=google_lens&image_id=…
+  # 免费档 1,000 次/月，缓存命中不计费；一次图搜约 4 秒（上传 1.1s + 搜索 3.0s）。
+  image_api_key_env: SERPAPI_API_KEY
+  image_max_matches: 5
+  # 宽限窗口：新图到达后，之后多少轮内还能把它从本地存档重挂（供「先问再查」）。
+  # 2026-09-14 真机教训：一轮太短——等对方再提起时，图早已不在窗口里。
+  image_carry_turns: 6
+
+voice:
+  # 语音合成（TTS）。**默认关闭**：关着时不建客户端、不声明能力、行为与今天逐字一致。
+  # 2026-09-14 用户裁定 1a：走阿里云百炼「声音设计」，音色从零造、不克隆。
+  # 回滚就是这一行改回 false + 重启。
+  enabled: true
+  base_url: https://dashscope.aliyuncs.com/api/v1
+  api_key_env: DASHSCOPE_API_KEY
+  # P0 冻结下来的音色身份：设计一次（那是掷骰子，见历史TTS计划 §2.17），
+  # 运行时只用这一个，不再重新设计。synth 模型必须与设计时的 target_model 一致。
+  model: qwen3-tts-vd-2026-01-26
+  voice_id: qwen-tts-vd-qichi_cast2-voice-20260914182133631-9160
+  # 单段上限：超过就退回文字，不截断（§2.35）。
+  max_chars_per_utterance: 120
+  synthesize_timeout_seconds: 12
+  cache_dir: data/voice
+  # 缓存按内容寻址；清理是独立的显式调用，绝不走热路径。
+  cache_max_total_bytes: 209715200
+  cache_max_age_days: 30
+
+output_guard:
+  reject_empty: true
+  reject_internal_prompt_leak: true
+  reject_raw_protocol_payload: true
+
+observability:
+  log_level: INFO
+  redact_secrets: true
+  log_context_sources: true
+  log_model_route: true
+  log_latency: true

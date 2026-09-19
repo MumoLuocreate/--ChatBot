@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>角色 · 运行面板</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">QQ 陪伴机器人</p>
+        <h1>角色运行面板</h1>
+        <p id="last-updated" class="muted">尚未刷新</p>
+      </div>
+      <div class="controls" aria-label="面板控制">
+        <span class="readonly-chip">只读</span>
+        <button id="refresh-button" type="button" title="立即刷新" aria-busy="false">刷新</button>
+        <label class="toggle"><input id="auto-refresh" type="checkbox"><span>自动刷新</span></label>
+      </div>
+    </header>
+
+    <nav class="view-tabs" aria-label="后台视图">
+      <button class="view-tab active" data-view="overview" type="button">总览</button>
+      <button class="view-tab" data-view="trace" type="button">对话</button>
+      <button class="view-tab" data-view="memory" type="button">记忆</button>
+      <button class="view-tab" data-view="presence" type="button">在场</button>
+      <button class="view-tab" data-view="ops" type="button">运维</button>
+    </nav>
+
+    <div id="error-banner" class="banner error" role="alert" hidden></div>
+    <div id="empty-state" class="empty" hidden>暂无可用运行数据</div>
+
+    <section id="verdict-band" class="verdict-band" data-view="overview" aria-labelledby="verdict-title">
+      <div class="verdict-main">
+        <p class="section-kicker">现在怎么样</p>
+        <h2 id="verdict-title" class="verdict-title">检查中</h2>
+        <p id="verdict-detail" class="verdict-detail">正在读取运行数据…</p>
+      </div>
+      <div class="verdict-side" aria-label="待关注数量">
+        <span id="verdict-issues" class="verdict-issues">—</span>
+        <span class="muted">项需要关注</span>
+      </div>
+    </section>
+
+    <section id="concerns-card" class="concerns-card" data-view="overview" aria-labelledby="concerns-heading">
+      <div class="section-heading"><div><p class="section-kicker">ATTENTION</p><h2 id="concerns-heading">需要你关注</h2></div><span id="concerns-count" class="muted">—</span></div>
+      <ul id="concerns-list" class="concerns-list"></ul>
+    </section>
+
+    <section id="features-card" class="features-card" data-view="overview" aria-labelledby="features-heading">
+      <div class="section-heading"><div><p class="section-kicker">SWITCHES</p><h2 id="features-heading">配置开关</h2></div><span id="features-source" class="muted">—</span></div>
+      <p class="panel-note">这些是**进程启动时实际加载**的开关。之后再改配置文件不会影响正在运行的进程，所以这里显示的是运行事实，不是文件内容。</p>
+      <p id="features-evidence" class="muted">正在读取…</p>
+      <dl id="features-list" class="facts"></dl>
+    </section>
+
+    <section id="chat-card" class="chat-card" data-view="overview" aria-labelledby="chat-heading">
+      <div class="section-heading"><div><p class="section-kicker">CONVERSATION</p><h2 id="chat-heading">最近对话</h2></div><span id="chat-count" class="muted">—</span></div>
+      <ol id="chat-timeline" class="chat-timeline"></ol>
+    </section>
+
+
+    <section class="status-band" data-view="overview" aria-labelledby="status-heading">
+      <div class="section-heading"><div><p class="section-kicker">LIVE STATUS</p><h2 id="status-heading">运行状态</h2></div><span id="ready-badge" class="badge">检查中</span></div>
+      <p id="ready-reason" class="status-reason">正在读取 readiness…</p>
+      <dl class="facts">
+        <div><dt>模型</dt><dd id="runtime-model">—</dd></div>
+        <div><dt>服务商</dt><dd id="runtime-provider">—</dd></div>
+        <div><dt>上下文窗口</dt><dd id="runtime-context">—</dd></div>
+        <div><dt>Owner QQ</dt><dd id="runtime-owner">—</dd></div>
+        <div><dt>Bot QQ</dt><dd id="runtime-bot">—</dd></div>
+        <div><dt>健康检查</dt><dd id="health-status">—</dd></div>
+        <div><dt>Forward WS</dt><dd id="ws-status">—</dd></div>
+        <div><dt>记忆 Worker</dt><dd id="memory-worker-status">—</dd></div>
+        <div><dt>主动 Worker</dt><dd id="initiative-worker-status">—</dd></div>
+      </dl>
+      <div class="status-meta"><span id="health-detail" class="muted">等待健康检查</span><span id="refresh-age" class="muted">尚未刷新</span></div>
+    </section>
+
+    <section data-view="overview" aria-labelledby="summary-heading">
+      <div class="section-heading"><h2 id="summary-heading">数据摘要</h2></div>
+      <div class="summary-grid">
+        <div class="metric metric-primary"><span>事件</span><strong id="count-events">—</strong><small id="event-window">最近 50 条</small></div>
+        <div class="metric"><span>发送队列</span><strong id="count-outbox">—</strong><small id="outbox-health">—</small></div>
+        <div class="metric"><span>记忆记录</span><strong id="count-memory">—</strong><small id="memory-health">—</small></div>
+        <div class="metric"><span>上下文版本</span><strong id="cursor-context">—</strong><small id="cursor-sequence">已处理序号 —</small></div>
+        <div class="metric"><span>最后用户活动</span><strong id="cursor-activity">—</strong><small id="cursor-activity-age">—</small></div>
+        <div class="metric"><span>主动下次尝试</span><strong id="initiative-next">—</strong><small id="initiative-next-age">—</small></div>
+      </div>
+    </section>
+
+    <div class="columns" data-view="overview">
+      <section aria-labelledby="outbox-heading" class="queue-section"><div class="section-heading"><div><p class="section-kicker">DELIVERY</p><h2 id="outbox-heading">发送队列</h2></div><span id="outbox-total" class="muted"></span></div><div id="outbox-summary" class="queue-summary"><span><strong id="outbox-sent-count">—</strong> 已送达</span><span><strong id="outbox-attention-count">—</strong> 需关注</span></div><details id="outbox-details" class="queue-details"><summary>最近发送记录 <span id="outbox-detail-label" class="muted"></span></summary><div id="outbox-list" class="list compact-list empty-list">暂无记录</div></details></section>
+      <section aria-labelledby="memory-heading"><div class="section-heading"><h2 id="memory-heading">记忆状态</h2></div><div id="memory-list" class="list empty-list">暂无记录</div><p id="memory-last-result" class="muted">最近整理：—</p></section>
+      <section aria-labelledby="initiative-heading"><div class="section-heading"><h2 id="initiative-heading">主动消息</h2></div><dl class="mini-facts"><div><dt>开关</dt><dd id="initiative-enabled">—</dd></div><div><dt>最后活动</dt><dd id="initiative-last-activity">—</dd></div><div><dt>原始状态</dt><dd id="initiative-state">—</dd></div></dl></section>
+    </div>
+
+    <section data-view="memory" aria-labelledby="fragments-heading" class="fragments-section">
+      <div class="section-heading"><div><p class="section-kicker">EPISODES</p><h2 id="fragments-heading">片段时间线</h2><p class="section-description">她记忆里的一个个"那次"。这里只有时间、级别与条数；点开才按顺序读当时双方的原话。</p></div><span id="fragments-count" class="muted">—</span></div>
+      <div id="fragment-timeline" class="list empty-list">暂无片段</div>
+    </section>
+
+    <section data-view="memory" aria-labelledby="recall-heading" class="recall-section">
+      <div class="section-heading"><div><p class="section-kicker">RECALL EXPLAINER</p><h2 id="recall-heading">召回解释</h2><p class="section-description">输入一句话，按线上同一套规则复算：她会取到哪一段、凭什么（日期 / 引用 / 内容词 / 兜底最近一次）。只读复算，不会发消息、不会改记忆。</p></div></div>
+      <form id="recall-form" class="recall-form">
+        <label class="search-field"><span>你说的话</span><input id="recall-query" type="search" placeholder="例如：细说九号那天" autocomplete="off"></label>
+        <button id="recall-submit" type="submit">复算</button>
+      </form>
+      <div id="recall-result" class="recall-result empty">等待输入</div>
+    </section>
+
+    <section data-view="memory" aria-labelledby="memories-heading" class="memory-details-section">
+      <div class="section-heading"><div><p class="section-kicker">RELATION MEMORY</p><h2 id="memories-heading">记忆明细</h2><p class="section-description">展示已评估字段、证据与审核事实；重要性不由记忆类型推导。</p></div><span id="memory-detail-count" class="muted"></span></div>
+      <div class="events-tools memory-tools"><label class="field">状态 <select id="memory-status-filter"><option value="all">全部记忆</option><option value="active">当前生效</option><option value="candidate">待确认</option><option value="inactive">已退出</option></select></label><label class="search-field"><span>搜索</span><input id="memory-search" type="search" placeholder="事实、证据原话或记忆 ID" autocomplete="off"></label></div>
+      <div class="memory-master-detail"><div id="memories-list" class="memory-master-list empty-list">暂无记忆明细</div><div id="memory-selected-detail" class="memory-selected-detail empty-list">选择一条记忆查看详情</div></div>
+      <div class="memory-pagination" aria-label="记忆分页"><button id="memory-page-prev" type="button" title="上一页">上一页</button><span id="memory-page-label" class="muted">第 1 页</span><button id="memory-page-next" type="button" title="下一页">下一页</button></div>
+    </section>
+
+    <section data-view="trace" aria-labelledby="response-audit-heading" class="response-audit-section">
+      <div class="section-heading"><div><p class="section-kicker">RESPONSE TRACE</p><h2 id="response-audit-heading">触发 → 上下文 → 生成 → 发送</h2><p class="section-description">仅显示可验证的输入、记忆、模型路由和发送阶段，不展示隐藏思考。</p></div><span id="response-audit-count" class="muted"></span></div>
+      <details class="glossary">
+        <summary>这些词是什么意思</summary>
+        <dl>
+          <div><dt>片段索引</dt><dd>她每一轮都能看到的一份清单，只有时间、级别和条数——知道"有这段"，但看不到内容。</dd></div>
+          <div><dt>明细原文</dt><dd>展开之后的逐字原话，就是你和她说过的那些句子。</dd></div>
+          <div><dt>未展开明细原文</dt><dd>索引里有这一段，但这一轮没把原话给她。只有你引用某条消息、或明确说「细说」「回忆一下」时才会展开。</dd></div>
+          <div><dt>关系记忆（常驻）</dt><dd>偏好、约定这类每一轮都会注入的记忆，不需要触发，所以她"天然记得"。</dd></div>
+          <div><dt>按话题想起</dt><dd>因为你这句里出现了相关词，才从记忆里检索出来并注入的。</dd></div>
+          <div><dt>消息回应</dt><dd>给某条消息贴一个 QQ 表情回应（reaction），不是发一条聊天消息。</dd></div>
+          <div><dt>外部工具</dt><dd>联网搜索之类的工具；关闭时她不联网、不调用任何外部服务。</dd></div>
+          <div><dt>直接引用</dt><dd>你回复某条消息时，被钉进上下文的原始那条。</dd></div>
+        </dl>
+      </details>
+      <div id="response-audit-list" class="audit-list empty-list">暂无可追溯回复</div>
+      <details class="technical-details"><summary>原始技术详情</summary><div id="trace-events-list" class="audit-list empty-list">缺少追踪证据</div></details>
+    </section>
+
+    <section data-view="trace" aria-labelledby="events-heading" class="events-section">
+      <div class="section-heading"><div><p class="section-kicker">AUDIT TRAIL</p><h2 id="events-heading">最近事件</h2></div><span id="event-count-label" class="muted"></span></div>
+      <div class="events-tools">
+        <label class="field">筛选 <select id="event-filter"><option value="all">全部事件</option><option value="inbound">入站</option><option value="outbound">出站</option><option value="attention">需关注</option></select></label>
+        <label class="search-field"><span>搜索</span><input id="event-search" type="search" placeholder="内容、事件 ID 或类型" autocomplete="off"></label>
+      </div>
+      <div class="table-wrap"><table><thead><tr><th>序号</th><th>角色</th><th>方向</th><th>类型</th><th>状态</th><th>时间</th><th>内容</th><th>引用</th><th>事件 ID</th></tr></thead><tbody id="events-body"><tr><td colspan="9" class="empty-list">暂无记录</td></tr></tbody></table></div>
+    </section>
+
+    <section data-view="presence" aria-labelledby="initiative-view-heading">
+      <div class="section-heading"><div><p class="section-kicker">INITIATIVE</p><h2 id="initiative-view-heading">主动消息状态</h2></div><span id="initiative-view-status" class="muted">只读</span></div>
+      <dl class="facts"><div><dt>开关</dt><dd id="initiative-view-enabled">—</dd></div><div><dt>活动锚点</dt><dd id="initiative-view-anchor">—</dd></div><div><dt>上下文版本</dt><dd id="initiative-view-context">—</dd></div><div><dt>下次尝试</dt><dd id="initiative-view-next">—</dd></div><div><dt>最近可靠活动</dt><dd id="initiative-view-activity">—</dd></div><div><dt>静默时段</dt><dd id="initiative-view-quiet">—</dd></div><div><dt>未回应</dt><dd id="initiative-view-unanswered">—</dd></div><div><dt>未回应上限</dt><dd id="initiative-view-max-unanswered">—</dd></div><div><dt>暂停 / 延后</dt><dd id="initiative-view-control">—</dd></div><div><dt>当前状态</dt><dd id="initiative-view-state">—</dd></div></dl>
+      <div id="initiative-timeline" class="list empty-list">无持久时间线证据</div>
+      <p class="panel-note">此视图只投影已持久化的主动消息状态，不触发调度或发送。</p>
+    </section>
+    <section data-view="presence" aria-labelledby="qq-view-heading">
+      <div class="section-heading"><div><p class="section-kicker">QQ INTERACTION</p><h2 id="qq-view-heading">QQ 互动</h2></div><span class="muted">能力与结果</span></div>
+      <div id="qq-interaction-list" class="list empty-list">暂无已记录 QQ 互动</div>
+    </section>
+    <section data-view="ops" aria-labelledby="ops-view-heading">
+      <div class="section-heading"><div><p class="section-kicker">QUALITY / OPERATIONS</p><h2 id="ops-view-heading">质量 / 运维</h2></div><span id="ops-snapshot-version" class="muted">快照只读</span></div>
+      <div class="summary-grid ops-grid"><div class="metric"><span>可追踪回复</span><strong id="ops-audit-count">—</strong><small>结构化证据</small></div><div class="metric"><span>需关注事件</span><strong id="ops-attention-count">—</strong><small>失败 / 未知 / 待处理</small></div><div class="metric"><span>最新事件</span><strong id="ops-latest-event">—</strong><small>时间线末端</small></div></div>
+      <div class="ops-blocks">
+        <section class="ops-block" aria-labelledby="ops-build-heading">
+          <div class="section-heading"><div><p class="section-kicker">BUILD</p><h3 id="ops-build-heading">构建与就绪</h3></div><span id="ops-build-status" class="badge">检查中</span></div>
+          <p id="ops-build-note" class="muted">正在读取…</p>
+          <dl class="facts">
+            <div><dt>代码指纹</dt><dd id="ops-build-code">—</dd></div>
+            <div><dt>运行进程指纹</dt><dd id="ops-build-marker">—</dd></div>
+          </dl>
+        </section>
+
+        <section class="ops-block" aria-labelledby="ops-db-heading">
+          <div class="section-heading"><div><p class="section-kicker">DATABASE</p><h3 id="ops-db-heading">数据库与备份</h3></div></div>
+          <dl class="facts">
+            <div><dt>库文件</dt><dd id="ops-db-name">—</dd></div>
+            <div><dt>schema</dt><dd id="ops-db-schema">—</dd></div>
+            <div><dt>主库</dt><dd id="ops-db-size">—</dd></div>
+            <div><dt>WAL</dt><dd id="ops-db-wal">—</dd></div>
+          </dl>
+          <div id="ops-backups" class="list compact-list empty-list">暂无备份记录</div>
+        </section>
+
+        <section class="ops-block" aria-labelledby="ops-watermark-heading">
+          <div class="section-heading"><div><p class="section-kicker">WATERMARKS</p><h3 id="ops-watermark-heading">记忆水位</h3></div></div>
+          <div id="ops-watermarks" class="list compact-list empty-list">暂无水位记录</div>
+        </section>
+      </div>
+      <p class="panel-note">此处只显示计数、状态和证据 ID；不展示提示词、生成正文或隐藏思考。</p>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

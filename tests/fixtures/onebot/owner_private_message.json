@@ -1,0 +1,18 @@
+{
+  "post_type": "message",
+  "message_type": "private",
+  "sub_type": "friend",
+  "self_id": 20001,
+  "user_id": "10001",
+  "target_id": "10001",
+  "sender": {"user_id": "10001", "nickname": "sanitized-owner"},
+  "message_id": 30001,
+  "time": 1787803200,
+  "message": [
+    {"type": "reply", "data": {"id": "29999"}},
+    {"type": "text", "data": {"text": "你好"}},
+    {"type": "face", "data": {"id": "14"}},
+    {"type": "image", "data": {"file": "sanitized-image-id"}},
+    {"type": "text", "data": {"text": "，角色"}}
+  ]
+}

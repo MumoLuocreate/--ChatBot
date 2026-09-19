@@ -1,0 +1,8 @@
+aiohttp>=3.9
+PyYAML>=6.0
+tokenizers>=0.23,<0.24
+tzdata>=2025.2
+pytest>=8
+pytest-asyncio>=0.23
+# 语音调参工具（离线试听、基频筛选）用；运行时不 import（见 doc/TTS-实施计划-20260914.md §2.24）
+numpy>=2.5

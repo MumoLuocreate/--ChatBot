@@ -1,0 +1,9 @@
+{
+  "schema": "qichi.provider-capability/v1",
+  "provider": "siliconflow",
+  "model_id": "deepseek-ai/DeepSeek-V4-Flash",
+  "context_tokens": 1048576,
+  "source": "https://siliconflow.cn/models",
+  "retrieved_at_utc": "2026-08-28T10:40:00+00:00",
+  "observation": "SiliconFlow model catalog entry for deepseek-ai/DeepSeek-V4-Flash states that the model supports 1M tokens of long context."
+}

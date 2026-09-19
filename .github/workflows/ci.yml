@@ -1,0 +1,28 @@
+name: CI
+
+# 目前只在 Windows 上跑：这套引擎是 Windows 部署的（NapCat + 启动脚本），
+# 测试里也有 Windows 专有路径（PID 探测、PowerShell 启动栈）。
+# 要加 Linux 需要一个真机 Linux 验证轮次，不能只靠推测。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+      - name: Test
+        run: python -m pytest -q
