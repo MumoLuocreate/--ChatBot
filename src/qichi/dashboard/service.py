@@ -4,7 +4,7 @@ import json
 import sqlite3
 import hashlib
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import quote
@@ -290,13 +290,15 @@ def _marker_conflict_reason(value: Mapping[str, object]) -> str:
 class DashboardService:
     """Read operational state from SQLite without any write-capable handle."""
 
-    def __init__(self, database_path: str | Path, marker_path: str | Path, runtime_info: Mapping[str, object] | None = None, *, lock_path: str | Path | None = None, pid_probe: object | None = None, clock: object | None = None, code_root: str | Path | None = None):
+    def __init__(self, database_path: str | Path, marker_path: str | Path, runtime_info: Mapping[str, object] | None = None, *, lock_path: str | Path | None = None, pid_probe: object | None = None, clock: object | None = None, code_root: str | Path | None = None, local_zone: tzinfo | None = None):
         self.database_path = Path(database_path)
         self.marker_path = Path(marker_path)
         self.runtime_info = dict(runtime_info or {})
         self.lock_path = Path(lock_path) if lock_path is not None else None
         self.pid_probe = pid_probe if callable(pid_probe) else self._default_pid_probe
         self.clock = clock if callable(clock) else lambda: datetime.now(timezone.utc)
+        # 日期分桶必须与引擎同源；面板没拿到配置时区时才退回本机时区（最后手段）。
+        self.local_zone = local_zone if local_zone is not None else datetime.now().astimezone().tzinfo
         self.code_root = Path(code_root) if code_root is not None else PROJECT_ROOT
 
     def snapshot(self, *, page: int = 1, limit: int = 50, memory_page: int = 1, memory_limit: int = 50, memory_status: str | None = None) -> dict[str, object]:
@@ -881,7 +883,7 @@ class DashboardService:
 
         query = text.strip()
         now = self.clock()
-        local_zone = datetime.now().astimezone().tzinfo
+        local_zone = self.local_zone
         windows = query_fragments((query,))
         days = referenced_dates((query,), now=now, local_zone=local_zone)
 

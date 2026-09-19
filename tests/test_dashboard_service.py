@@ -104,6 +104,8 @@ def test_trace_category_whitelist_covers_every_context_category():
     assert missing == [], f"这些上下文字段会被静默丢弃：{missing}"
 
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
 import pytest
 
 import qichi.dashboard.service as dashboard_service_module
@@ -1104,3 +1106,30 @@ def test_features_absence_and_corruption_are_reported_not_guessed(tmp_path):
     assert "无法解析" in broken["features_evidence"]
     assert "api_key" not in str(broken).lower() and "access_token" not in str(broken).lower()
 
+
+
+def test_recall_explanation_uses_the_configured_timezone(tmp_path):
+    """面板复算必须与引擎同源：同一句话在 UTC 机器上会指到前一天。
+
+    2026-08-28T20:00Z 在 UTC 还是 08-28，在东八区已经是 08-29。
+    面板原先硬用本机时区，所以同一句「今天」在两种机器上给出不同的日期。
+    """
+
+    database = Database(tmp_path / "dashboard-tz.sqlite3")
+    database.close()
+    marker_path = tmp_path / "dashboard-tz-ready.json"
+    marker(marker_path)  # 合法 READY marker，否则面板读不到 owner 就提前返回
+    clock = lambda: datetime(2026, 8, 28, 20, 0, tzinfo=timezone.utc)
+
+    utc_service = DashboardService(
+        tmp_path / "dashboard-tz.sqlite3", marker_path, clock=clock, local_zone=timezone.utc
+    )
+    shanghai_service = DashboardService(
+        tmp_path / "dashboard-tz.sqlite3",
+        marker_path,
+        clock=clock,
+        local_zone=ZoneInfo("Asia/Shanghai"),
+    )
+
+    assert utc_service.recall_explanation("今天")["dates"] == ["2026-08-28"]
+    assert shanghai_service.recall_explanation("今天")["dates"] == ["2026-08-29"]
