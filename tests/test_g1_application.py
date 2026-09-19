@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import json
 
 import pytest
@@ -99,6 +100,8 @@ def app(database, llm, napcat, worker=None, clock=lambda: NOW):
     return G0Application(
         database, builder(), engine, napcat, owner_qq=OWNER, bot_qq=BOT,
         role_core="你是角色。", clock=clock, memory_worker=worker,
+        # 夹具时钟固定在 +08:00；显式给时区，测试就不再看运行机器的时区。
+        local_zone=ZoneInfo("Asia/Shanghai"),
     )
 
 

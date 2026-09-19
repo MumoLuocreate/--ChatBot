@@ -124,7 +124,7 @@ def _image_data_url(image: ModelImage, read_image: Callable[[str], bytes]) -> st
         raise LLMImageUnavailableError("attached image could not be read") from None
     if not isinstance(content, bytes) or not content:
         raise LLMImageUnavailableError("attached image is empty")
-    return f"data:{image.content_type};base64,{base64.b64encode(content).decode("ascii")}"
+    return f"data:{image.content_type};base64,{base64.b64encode(content).decode('ascii')}"
 
 
 def wire_messages(

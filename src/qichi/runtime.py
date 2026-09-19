@@ -321,6 +321,9 @@ def build_runtime(
         # one data root instead of two.
         media_root=_resolve_project_path(project_root, config.storage.database_path).parent,
         auto_quote_current_message=config.dialogue.auto_quote_current_message,
+        # 日期分桶按配置声明的时区走，不跟随运行机器：否则把部署搬到 UTC 机器上，
+        # 「今天/昨天」会在午夜前后整体错位（2026-09-19 CI 在 UTC runner 上复现）。
+        local_zone=ZoneInfo(config.app.timezone),
         always_include_memory_types=config.memory.always_include_types,
         memory_candidate_limit=config.memory.retrieval_candidate_top_k,
         memory_context_limit=config.memory.episodic_top_k,
