@@ -7,7 +7,7 @@ import pytest
 
 from qichi.domain.events import ConversationEvent, MessageSegment
 from qichi.dialogue.llm_client import LLMConnectionError, LLMTimeoutError
-from qichi.memory.extractor import MemoryExtractor
+from qichi.memory.extractor import MemoryExtractor, MemoryOutcome
 
 
 NOW = datetime(2026, 8, 28, 15, 0, tzinfo=timezone.utc)
@@ -385,6 +385,128 @@ async def test_an_invalid_candidate_no_longer_throws_away_the_timeline():
     assert result.ok, "明细已经解析好了，不该因为候选项被丢弃而整窗作废"
     assert result.candidates == () and result.reviews == ()
     assert len(result.details) == 1, "时间线必须留下"
+
+
+def _detail(**overrides: object) -> dict[str, object]:
+    detail = {
+        "ordinal": 0, "detail_kind": "message", "actor": "mumo",
+        "reality_scope": "conversation", "normalized_detail": "用户说喜欢雨声",
+        "exact_quote": "我喜欢雨声", "source_event_id": "source",
+        "certainty": "explicit", "temporal_scope": "historical", "status": "active",
+        "privacy_class": "ordinary", "recall_policy": "daily_safe",
+        "evidence": [{"event_id": "source", "role": "source"}],
+    }
+    detail.update(overrides)
+    return detail
+
+
+@pytest.mark.asyncio
+async def test_a_quote_spanning_her_split_parts_is_still_rejected():
+    """锁定当前契约：逐字来源是**所引那一条事件**，跨分段引用会被拒。
+
+    2026-09-22 曾经为了「她那一轮」把来源放宽到同组各段拼接，但真机数据推翻了它的必要性：
+    新落库的 242 条明细里 239 条逐字来自单条事件、0 条真的跨分段（只有 3 条差两端句读，
+    那已由 quote_is_verbatim 处理）。放宽反而让"写库"比"渲染"更宽——上下文里未必加载了
+    同组其它分段，于是已落库的引文可能在渲染时被判不合格。所以撤销放宽，7 处统一为
+    单事件作用域 + 忽略两端句读。**如果将来真的出现跨分段引用，必须 7 处一起放宽**
+    （需要一个所有校验点都能拿到的"那一轮文本"服务）。
+    """
+
+    first = event(
+        "p0", "你别急，我先把话说清楚", actor="qichi", direction="outbound", sequence=0,
+        metadata={"delivery_group": {"group_event_id": "g1", "part_index": 0, "part_count": 2},
+                  "generation_metadata": {"source": "dialogue"}},
+    )
+    second = event(
+        "p1", "——我在意的是你有没有把话听完。", actor="qichi", direction="outbound", sequence=1,
+        metadata={"delivery_group": {"group_event_id": "g1", "part_index": 1, "part_count": 2},
+                  "generation_metadata": {"source": "dialogue"}},
+    )
+    raw = json.dumps({
+        "outcome": {"kind": "memory_found", "reason_code": "explicit_user_preference"},
+        "candidates": [],
+        "reviews": [],
+        "details": [
+            _detail(
+                actor="qichi", source_event_id="p0",
+                normalized_detail="她说她把话说清楚了",
+                exact_quote="我先把话说清楚——我在意的是你有没有把话听完。",
+                evidence=[{"event_id": "p0", "role": "source"}],
+            ),
+        ],
+    }, ensure_ascii=False)
+
+    result = await MemoryExtractor(FakeLLM(raw)).extract((first, second))
+
+    assert not result.ok, "跨分段引用不在单条事件里——按当前契约整窗失败（有意的取舍，见 docstring）"
+
+
+@pytest.mark.asyncio
+async def test_a_fabricated_quote_is_still_rejected():
+    """不误判：扩到「她那一轮」不是放松——**任何分段里都没有**的引文仍旧被拒。"""
+
+    first = event(
+        "p0", "你别急，我先把话说清楚", actor="qichi", direction="outbound", sequence=0,
+        metadata={"delivery_group": {"group_event_id": "g1", "part_index": 0, "part_count": 2},
+                  "generation_metadata": {"source": "dialogue"}},
+    )
+    second = event(
+        "p1", "——我在意的是你有没有把话听完。", actor="qichi", direction="outbound", sequence=1,
+        metadata={"delivery_group": {"group_event_id": "g1", "part_index": 1, "part_count": 2},
+                  "generation_metadata": {"source": "dialogue"}},
+    )
+    raw = json.dumps({
+        "outcome": {"kind": "memory_found", "reason_code": "explicit_user_preference"},
+        "candidates": [],
+        "reviews": [],
+        "details": [
+            _detail(
+                actor="qichi", source_event_id="p0", exact_quote="我从来没在意过这些",
+                evidence=[{"event_id": "p0", "role": "source"}],
+            ),
+        ],
+    }, ensure_ascii=False)
+
+    result = await MemoryExtractor(FakeLLM(raw)).extract((first, second))
+
+    assert not result.ok, "伪造的引文必须让窗口失败"
+
+
+@pytest.mark.asyncio
+async def test_a_window_where_every_item_is_invalid_still_fails():
+    """不误判：逐条丢弃不等于「什么都收」——全坏且确实什么都没剩下时，窗口照旧失败。"""
+
+    source = event("source", "我喜欢雨声")
+    raw = json.dumps({
+        "outcome": {"kind": "memory_found", "reason_code": "explicit_user_preference"},
+        "candidates": [candidate(evidence=[
+            {"event_id": "source", "actor": "qichi", "exact_quote": "喜欢雨声", "role": "source"}
+        ])],
+        "reviews": [],
+        "details": [_detail(exact_quote="他喜欢听雨的声音")],
+    }, ensure_ascii=False)
+
+    result = await MemoryExtractor(FakeLLM(raw)).extract((source,))
+
+    assert not result.ok
+    assert result.candidates == () and result.details == ()
+
+
+@pytest.mark.asyncio
+async def test_a_structurally_broken_detail_list_still_fails_the_window():
+    """不误判：批次级结构问题（不是列表）不属于「一条坏项」，仍然整窗失败。"""
+
+    source = event("source", "我喜欢雨声")
+    raw = json.dumps({
+        "outcome": {"kind": "memory_found", "reason_code": "explicit_user_preference"},
+        "candidates": [candidate()],
+        "reviews": [],
+        "details": "not a list",
+    }, ensure_ascii=False)
+
+    result = await MemoryExtractor(FakeLLM(raw)).extract((source,))
+
+    assert not result.ok
 
 
 @pytest.mark.asyncio
@@ -784,6 +906,88 @@ async def test_all_malformed_review_items_remain_a_parse_failure():
         "parse_error_code": "all_items_invalid",
         "dropped_review_count": "1",
         "review_error_codes": "review_invalid",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_window_of_only_her_own_words_closes_out_when_every_item_is_invalid():
+    """2026-09-24（用户裁定第一半）：她单独锚定的窗口不许把记忆水位钉死。
+
+    真机形状（seq 10443-10444）：窗口里只有她的两句主动话，没有用户的任何事件；
+    她复述了一条已有约定，模型据此产出一条复述项，该项校验不过 ——
+    旧行为是 _AllItemsInvalid 把整窗判失败，重试两次后停在 failed 且不排重试，
+    水位永久停住。这种「整窗全不合法」在没有用户证据的窗口里是正常结局：静默收口。
+    """
+
+    first = event(
+        "init-1", "说完了，你那边不用应。我在这儿 (\u00b4\u03c9\u0060)",
+        actor="qichi", direction="outbound",
+    )
+    second = event(
+        "init-2", "墨——想你了，就是刚想到中秋那晚你说要陪我到底",
+        actor="qichi", direction="outbound",
+        sequence=1, at=NOW + timedelta(minutes=1),
+    )
+    malformed = review(evidence=[{
+        "event_id": "init-2", "actor": "mumo",
+        "exact_quote": "中秋那晚你说要陪我到底", "role": "confirmation",
+    }])
+    result = await MemoryExtractor(
+        FakeLLM(payload(candidates=[], reviews=[malformed]))
+    ).extract((first, second))
+
+    assert result.ok, "没有用户事件的窗口不该因为复述项校验不过而整窗失败"
+    assert result.candidates == () and result.reviews == ()
+    assert result.outcome == MemoryOutcome("no_persistent_memory", "nothing_new")
+    assert result.failure is None
+    # 丢掉的条数仍留在诊断里：事后能认出「这里本来是 all_items_invalid」。
+    assert result.diagnostics.get("dropped_review_count") == "1"
+
+
+@pytest.mark.asyncio
+async def test_a_window_of_only_her_own_words_closes_out_for_a_dropped_candidate_too():
+    """同一个收口对候选项同样成立（她单独锚定的窗口，候选项全被丢弃）。"""
+
+    hers = event(
+        "init-1", "我在这儿，你不用应", actor="qichi", direction="outbound",
+    )
+    wrong_actor = candidate(evidence=[{
+        "event_id": "init-1", "actor": "qichi", "exact_quote": "我在这儿", "role": "source",
+    }])
+    result = await MemoryExtractor(
+        FakeLLM(payload(candidates=[wrong_actor], reviews=[]))
+    ).extract((hers,))
+
+    assert result.ok
+    assert result.candidates == () and result.reviews == ()
+    assert result.outcome == MemoryOutcome("no_persistent_memory", "nothing_new")
+    assert result.diagnostics == {
+        "dropped_candidate_count": "1",
+        "candidate_error_codes": "candidate_evidence",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_window_with_his_words_still_fails_closed_when_every_item_is_invalid():
+    """反向守卫：窗口里只要有一句用户的话，整窗全不合法**仍必须** fail-closed。"""
+
+    hers = event(
+        "init-1", "我在这儿", actor="qichi", direction="outbound",
+    )
+    his = event("his-1", "我在", sequence=1, at=NOW + timedelta(minutes=1))
+    wrong_actor = candidate(evidence=[{
+        "event_id": "init-1", "actor": "qichi", "exact_quote": "我在这儿", "role": "source",
+    }])
+    result = await MemoryExtractor(
+        FakeLLM(payload(candidates=[wrong_actor], reviews=[]))
+    ).extract((hers, his))
+
+    assert not result.ok, "含用户往返的正常窗口不许被这条收口放宽"
+    assert result.failure is not None
+    assert result.failure.details == {
+        "parse_error_code": "all_items_invalid",
+        "dropped_candidate_count": "1",
+        "candidate_error_codes": "candidate_evidence",
     }
 
 

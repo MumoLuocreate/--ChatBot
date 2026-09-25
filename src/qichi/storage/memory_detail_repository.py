@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Mapping
 from uuid import NAMESPACE_URL, uuid5
 
-from qichi.domain.events import ConversationEvent
+from qichi.domain.events import ConversationEvent, quote_is_verbatim
 from qichi.domain.memory_details import (
     MemoryDetailDraft,
     MemoryDetailEvidence,
@@ -38,6 +38,39 @@ MAX_DETAILS_PER_FRAGMENT = 32
 
 # 排序门槛：连 4 个字的连续共同串都没有时，只认「窗口命中 ≥2」这条粗信号。
 _RANKING_MIN_RUN = 4
+
+
+def reject_detail_draft(
+    draft: MemoryDetailDraft, ordered_events: Mapping[str, ConversationEvent]
+) -> str | None:
+    """这条明细能不能落库？不能就返回原因，能就返回 None。
+
+    **明细可落库性的唯一来源**：仓储写库前用它，明细补跑（MemoryDetailPass）丢弃坏项时
+    也用它。补跑原先只看结构、不看引文，于是坏引文一路走到仓储的严格校验、**整个 job
+    失败**——真机 2026-09-22 一条坏引文把记忆水位钉住 8 小时，269 条事件进不了记忆
+    （seq 9662-9880）。补跑的契约本来就是「Invalid entries are dropped and counted」，
+    所以把规则共享给它：严格的门留在仓储，失败点不留在整窗。
+    """
+
+    source = ordered_events.get(draft.source_event_id)
+    if source is None:
+        return "detail source event is outside the fragment"
+    # 逐字来源是**她那一轮**（发送层把一轮回复拆成多条事件），不是单条事件。
+    # 伪造的引文在任何分段里都找不到，仍然被拒。
+    if not quote_is_verbatim(draft.exact_quote, source.text):
+        return "detail exact quote is absent from source event"
+    if draft.actor in {"mumo", "qichi"} and source.actor != draft.actor:
+        return "detail actor does not match source event"
+    seen: set[str] = set()
+    for event_id, _role in draft.evidence:
+        if event_id not in ordered_events:
+            return "detail evidence event is outside the fragment"
+        if event_id in seen:
+            return "detail evidence event IDs must be unique"
+        seen.add(event_id)
+    if draft.source_event_id not in seen:
+        return "detail source event must be detail evidence"
+    return None
 
 
 class MemoryDetailRepository:
@@ -141,25 +174,13 @@ class MemoryDetailRepository:
         for expected_ordinal, draft in enumerate(drafts):
             if draft.ordinal != expected_ordinal:
                 raise ValueError("detail ordinals must be contiguous")
-            source = ordered_events.get(draft.source_event_id)
-            if source is None:
-                raise ValueError("detail source event is outside the fragment")
-            if source.text is None or draft.exact_quote not in source.text:
-                raise ValueError("detail exact quote is absent from source event")
-            if draft.actor in {"mumo", "qichi"} and source.actor != draft.actor:
-                raise ValueError("detail actor does not match source event")
-            evidence: list[MemoryDetailEvidence] = []
-            seen: set[str] = set()
-            for event_id, role in draft.evidence:
-                evidence_source = ordered_events.get(event_id)
-                if evidence_source is None:
-                    raise ValueError("detail evidence event is outside the fragment")
-                if event_id in seen:
-                    raise ValueError("detail evidence event IDs must be unique")
-                seen.add(event_id)
-                evidence.append(MemoryDetailEvidence(event_id, role))
-            if draft.source_event_id not in seen:
-                raise ValueError("detail source event must be detail evidence")
+            reason = reject_detail_draft(draft, ordered_events)
+            if reason is not None:
+                raise ValueError(reason)
+            source = ordered_events[draft.source_event_id]
+            evidence: list[MemoryDetailEvidence] = [
+                MemoryDetailEvidence(event_id, role) for event_id, role in draft.evidence
+            ]
             output.append(
                 MemoryDetailRecord(
                     detail_id=cls.detail_id(fragment.fragment_id, draft),

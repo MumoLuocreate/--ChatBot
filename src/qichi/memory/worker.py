@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 
 from qichi.domain.events import ConversationEvent
+from qichi.domain.memory import MEMORY_RELIABLE_SOURCES
 from qichi.memory.detail_pass import MemoryDetailPass, MemoryDetailPassError
 from qichi.memory.extractor import (
     SAFE_PARSE_ERROR_CODES,
@@ -103,6 +104,22 @@ def _detail_pass_failure_code(error: BaseException) -> str:
     if "timeout" in type(error).__name__.casefold():
         return "detail_pass_timeout"
     return "detail_pass_error"
+
+
+# 领域层校验常量的措辞（见 memory_detail_repository / memory_repository / extractor
+# 里的 raise 文本）。只有带这些措辞的 ValueError/TypeError 才算"内容层失败"。
+_DOMAIN_VALIDATION_MARKERS = (
+    "quote is absent",
+    "is invalid",
+    "must be",
+    "does not match",
+    "requires",
+    "is outside the fragment",
+    "is not in evidence",
+    "is context-only",
+    "must not",
+    "ordinals must be contiguous",
+)
 
 
 def safe_domain_error(message: Any) -> str | None:
@@ -207,7 +224,7 @@ class MemoryWorker:
     # 2026-09-15：内容层失败不再「一次定生死」，先给这么多次**冷却重试**再隔离。
     # 起因：DeepSeek 官方崩溃那一晚，后台模型连续超时并返回残缺 JSON，一次 parse_error
     # 就让 seq 6566–6600（35 条，正是用户纠正她的那一段）在两次尝试后被永久隔离，
-    # 那一段再没进记忆层（历史修复计划）。
+    # 那一段再没进记忆层（doc/修复计划-20260915-记忆补录与折半重抽.md）。
     # 关键判断：**上游崩坏时返回的残缺 JSON，和「这段内容真的抽不出来」长得一模一样**，
     # 所以只能靠「等一会儿再试一次」来区分，不能靠一次失败下结论。
     # 代价有界：每段最多多 CONTENT_FAILURE_REOPEN_ROUNDS 次后台调用，间隔 ≥ 冷却时间。
@@ -336,7 +353,15 @@ class MemoryWorker:
                     )
                 elif row["status"] == "failed":
                     if self._failure_is_retryable_tx(connection, row):
-                        if self._terminal_failure_old_enough(row, now):
+                        # 2026-09-22：**内容层失败在启动时不等冷却**。冷却的用意（见
+                        # _terminal_failure_old_enough 的 docstring）是不让一次重启就去重试
+                        # **正在失败的供应商**；而内容层失败是**我们自己的校验拒了模型输出**
+                        # （例如一条引文末尾多一个标点），重启恰好可能带着修复，等满 30 分钟
+                        # 毫无意义——真机上重启比冷却到期早 2 分钟，白等一轮才发现还是卡着。
+                        # 供应商/瞬时类失败照旧受冷却约束，不会变成重启即重试的风暴。
+                        category = row["failure_category"] or "worker_error"
+                        provider_like = category in self._TRANSIENT_FAILURE_CATEGORIES
+                        if (not provider_like) or self._terminal_failure_old_enough(row, now):
                             snapshot = self._snapshot_tx(connection, conversation)
                             if snapshot is not None:
                                 self._reopen_failed_tx(connection, row, snapshot, now)
@@ -569,13 +594,71 @@ class MemoryWorker:
                 ),
             )
         except Exception as error:
+            category, details = self._consolidation_failure(error)
             failure = ExtractionFailure(
-                "repository_error",
+                category,
                 f"{error.__class__.__name__}: repository transaction failed",
                 tuple(item.event_id for item in claim.snapshot.events),
+                details,
             )
             finish_now = self._now() if self._clock_explicit else now
             return (self._finish_failure(claim, failure, finish_now),)
+
+    @staticmethod
+    def _consolidation_failure(error: BaseException) -> tuple[str, dict[str, str]]:
+        """写库/事务失败算哪一类，以及能留下的诊断。
+
+        **2026-09-22 修正**：这里原先一律标成 `repository_error`，而它在
+        `_TRANSIENT_FAILURE_CATEGORIES` 里——于是**代码自己的领域校验失败**
+        （`ValueError: detail exact quote is absent from source event` 这类）被当成网络抖动：
+        永远不会被隔离、一直重试，启动时还要白等 30 分钟冷却。真机上一条约文里的坏标点
+        就这样把记忆水位钉了 8 小时。
+
+        判据**两条一起**才认定内容层（单看 `safe_domain_error` 不够——它只是形状过滤，
+        "database is locked" 那种驱动消息也会通过）：
+
+        1. 异常是 `ValueError` / `TypeError`（我们自己领域层抛的，不是 sqlite/驱动异常）；
+        2. 消息里带**已知的领域校验措辞**（下表是代码自有常量的措辞，不是用户内容）。
+
+        其余一律仍是 `repository_error`（瞬时类），保守地留在"稍后重试"那一档。
+        """
+
+        if not isinstance(error, (ValueError, TypeError)):
+            return "repository_error", {}
+        message = safe_domain_error(str(error))
+        if message is None:
+            return "repository_error", {}
+        if not any(marker in message for marker in _DOMAIN_VALIDATION_MARKERS):
+            return "repository_error", {}
+        return "schema_error", {"domain_error": message}
+
+    def _take_usage(self) -> dict[str, str]:
+        """取走本轮累计的记忆后台 token 用量（**读后清零**），供 job 账本记录。
+
+        2026-09-22：记忆后台此前完全不记账——用户问"一天怎么花了 20 块"时，
+        只能靠窗口规模猜。抽取与明细补跑各自累计，这里是唯一的取走点（单消费者，
+        所以"自上次取走以来"就等于"本轮"）。
+        """
+
+        output: dict[str, str] = {}
+        sources = (
+            ("extraction", getattr(self.extractor, "llm", None)),
+            ("detail", self.detail_pass),
+        )
+        for prefix, source in sources:
+            if source is None:
+                continue
+            for field in ("input_tokens", "output_tokens", "cache_hit_tokens", "reasoning_tokens", "calls"):
+                name = "usage_" + field
+                value = getattr(source, name, None)
+                if not isinstance(value, int) or value <= 0:
+                    continue
+                output["%s_%s" % (prefix, field)] = str(value)
+                try:
+                    setattr(source, name, 0)
+                except (AttributeError, TypeError):
+                    pass
+        return output
 
     def failures(self) -> tuple[ExtractionFailure, ...]:
         if self.database is None:
@@ -750,7 +833,10 @@ class MemoryWorker:
                     "failed" if terminal else "retry_scheduled",
                     now=now,
                     failure_category=category,
-                    details=self._safe_failure_details(failure),
+                    details=dict(
+                        self._safe_failure_details(failure),
+                        **self._safe_usage(self._take_usage()),
+                    ),
                 )
                 # 额度没用完就让它留在 failed：恢复路径会在冷却之后重开同一段
                 # （2026-09-15：上游崩坏导致的 parse_error 不该一次定生死）。
@@ -900,7 +986,7 @@ class MemoryWorker:
                     "completed",
                     now=now,
                     details=self._merge_diagnostics(
-                        result.diagnostics,
+                        dict(result.diagnostics),
                         candidate_count=len(result.candidates),
                         review_count=len(result.reviews),
                         dropped_review_count=dropped_review_count,
@@ -913,6 +999,7 @@ class MemoryWorker:
                         detail_pass_count=sum(len(unit[2]) for unit in units),
                         split_fragment_count=len(units) if len(units) > 1 else None,
                         restated_memory_count=len(batch.restated_memory_ids),
+                        usage=self._take_usage(),
                     ),
                 )
                 self._persist_watermark_tx(
@@ -935,12 +1022,9 @@ class MemoryWorker:
             # Domain validation messages are code-owned constants ("fragment_type
             # is invalid"), so they may be kept; anything else stays a class name
             # (a database or provider message can quote user content).
-            details = {}
-            message = safe_domain_error(str(error))
-            if message is not None:
-                details["domain_error"] = message
+            category, details = self._consolidation_failure(error)
             failure = ExtractionFailure(
-                "repository_error",
+                category,
                 f"{error.__class__.__name__}: consolidation transaction failed",
                 tuple(item.event_id for item in claim.snapshot.events),
                 details,
@@ -1136,6 +1220,37 @@ class MemoryWorker:
                 output[key] = ",".join(sorted(set(codes)))
         return output
 
+    # 2026-09-24：用量键固定为「来源_字段」，值必须是纯 ASCII 数字且有上界——
+    # 与诊断键同款的 fail-closed 形状守卫。
+    _USAGE_KEY_RE = re.compile(
+        r"^(extraction|detail)_(input_tokens|output_tokens|cache_hit_tokens|"
+        r"reasoning_tokens|calls)$"
+    )
+    _MAX_USAGE_VALUE = 10 ** 12
+
+    @staticmethod
+    def _safe_usage(usage: Mapping[str, Any]) -> Mapping[str, str]:
+        """Bound the backend usage counters that go into the public job ledger.
+
+        2026-09-24（真机 298 条 job 事件里 0 条带 usage_*）：这些键是**我们自己**的
+        整数，不是模型内容，所以它们必须走 _safe_parse_details 白名单**之外**的单独
+        一条路——那条白名单只放行固定十几个诊断键，会把 usage_* 静默丢掉。
+        形状守卫保持一致：固定键名、纯 ASCII 数字、有上界。
+        """
+
+        output: dict[str, str] = {}
+        if not isinstance(usage, Mapping):
+            return output
+        for key, value in usage.items():
+            if not isinstance(key, str) or MemoryWorker._USAGE_KEY_RE.match(key) is None:
+                continue
+            if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+                continue
+            if int(value) > MemoryWorker._MAX_USAGE_VALUE:
+                continue
+            output[key] = value
+        return output
+
     @staticmethod
     def _merge_diagnostics(
         details: Mapping[str, Any],
@@ -1150,8 +1265,11 @@ class MemoryWorker:
         detail_pass_count: int = 0,
         split_fragment_count: int | None = None,
         restated_memory_count: int = 0,
+        usage: Mapping[str, Any] | None = None,
     ) -> Mapping[str, str]:
         output = dict(MemoryWorker._safe_parse_details(details))
+        # 用量不是 details 的内容，走白名单之外的这一条路放行。
+        output.update(MemoryWorker._safe_usage(usage or {}))
         if not 0 <= candidate_count <= _MAX_DIAGNOSTIC_ITEMS:
             raise ValueError("candidate_count is out of range")
         if not 0 <= review_count <= _MAX_DIAGNOSTIC_ITEMS:
@@ -1554,7 +1672,17 @@ class MemoryWorker:
             return False
         metadata = event.metadata
         generation = metadata.get("generation_metadata") if isinstance(metadata, Mapping) else None
-        return isinstance(generation, Mapping) and generation.get("source") in {"dialogue", "interaction"}
+        # 卡⑤ 2026-09-21：主动开口也可信。用户裁定「主动消息进记忆，但一般主动消息
+        # 很少有有效信息，除非她找我本身也是一件值得记录的事情」——这两半都由结构保证：
+        #   - 记录所有权按取证角色分配（memory_repository._validate_active_evidence 与
+        #     提取器的角色矩阵）：关于用户的记录必须以用户的话为证据，所以从她的主动话里
+        #     生不出关于他的偏好；
+        #   - 她自己的记录走 self_expression（只认 actor=qichi 证据，且不参与审核）。
+        # 另一个收益是窗口完整：此前 _snapshot_tx 会丢掉她的开场，提取器读到的是
+        # 「他的回复没有前因」的残片段。
+        # 注意：extractor._structural_sensitive_episode 的 qichi 池**不放宽**——那里
+        # 只需要「双边交换够长」的门槛，放进来会削弱场景结构守卫。
+        return isinstance(generation, Mapping) and generation.get("source") in MEMORY_RELIABLE_SOURCES
 
     @staticmethod
     def _snapshot_key(

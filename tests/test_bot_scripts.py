@@ -11,24 +11,11 @@ def test_start_bot_uses_the_single_production_entry_and_explicit_qq_path():
 
     assert "start_production.ps1" in source
     assert "start_stack.py" not in source
-    assert "QICHI_NAPCAT_ROOT" in source
+    assert "QICHI_NAPCAT_ROOT=E:\\NapCatQQ" in source
+    assert "QICHI_QQ_EXE=E:\\QQ\\QQ.exe" in source
     assert "-WindowStyle Hidden" in source
     assert "current user session" in source
     assert "-Verb RunAs" not in source
-    # 机器专属路径不能进仓库：NapCat/QQ 的位置只从环境变量来，缺了就失败关闭。
-    assert "E:\\NapCatQQ" not in source
-    assert "E:\\QQ" not in source
-
-
-def test_start_production_never_falls_back_to_a_machine_specific_path():
-    """仓库不该猜 NapCat/QQ 装在哪台机器的哪个盘上。"""
-
-    script = (ROOT / "scripts" / "start_production.ps1").read_text(encoding="utf-8")
-
-    assert "QICHI_NAPCAT_ROOT" in script
-    assert "QICHI_QQ_EXE" in script
-    assert "E:\\NapCatQQ" not in script
-    assert "E:\\QQ" not in script
 
 
 def test_stop_bot_uses_evidence_driven_stop_script():

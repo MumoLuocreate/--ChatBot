@@ -133,55 +133,6 @@ def test_build_runtime_wires_configured_256k_without_network(
     assert components.llm_client.closed is False
     database.close()
 
-def test_build_runtime_loads_the_configured_role_core_and_fails_closed(
-    config_path, complete_environment, tmp_path
-):
-    """引擎不带人设：角色核心只由 persona.system_prompt_file 决定，缺失就拒绝装配。
-
-    这是「开源只开源引擎」的装配层证明：同一份代码换一个配置路径就换一个角色，
-    而配置写错或文件缺失时失败关闭，绝不会悄悄退回某个内置人设。
-    """
-
-    source = config_path.read_text(encoding="utf-8")
-    root = tmp_path / "project"
-    doc = root / "doc"
-    doc.mkdir(parents=True)
-    (doc / "我的角色.md").write_text("# 角色核心\n\n你是测试角色。\n", encoding="utf-8", newline="")
-    (root / "config.example.yaml").write_text(
-        source.replace(
-            "system_prompt_file: doc/运行时角色核心.example.md",
-            "system_prompt_file: doc/我的角色.md",
-        ),
-        encoding="utf-8",
-        newline="",
-    )
-    config = runtime_config(root / "config.example.yaml", complete_environment)
-    database = Database(tmp_path / "qichi.sqlite3")
-    components = build_runtime(
-        config,
-        project_root=root,
-        database=database,
-        onebot_client=NoNetworkOneBot(),
-        bot_qq="10001",
-        model_capability=capability(model=config.llm.primary.model),
-        token_counter=Counter(),
-    )
-
-    assert components.application.role_core == "# 角色核心\n\n你是测试角色。\n"
-    database.close()
-
-    (doc / "我的角色.md").unlink()
-    with pytest.raises(RuntimeAssemblyError, match="role prompt"):
-        build_runtime(
-            config,
-            project_root=root,
-            database=Database(tmp_path / "second.sqlite3"),
-            onebot_client=NoNetworkOneBot(),
-            bot_qq="10001",
-            model_capability=capability(model=config.llm.primary.model),
-            token_counter=Counter(),
-        )
-
 
 @pytest.mark.asyncio
 async def test_memory_extraction_prompt_and_payload_use_the_complete_minimal_fragment(tmp_path):

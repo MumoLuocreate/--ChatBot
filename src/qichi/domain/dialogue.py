@@ -299,6 +299,9 @@ class DialogueResult:
     # 2026-09-14：哪一段用语音说（1 起）。语音是**载体**，不是表达——
     # 台词与语气仍由这一次生成决定，这里只记"第几段改用音频"。
     voice_part_index: int | None = None
+    # 2026-09-20：她在这一轮里标记的场景状态（"on"/"off"）。这只是**状态**，
+    # 不是表达：正文里不会出现它，代码只把它记下来、下一轮当作事实陈述。
+    scene_mark: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.text, "text")
@@ -328,6 +331,8 @@ class DialogueResult:
                 raise TypeError("voice_part_index must be an int or None")
             if not 1 <= index <= len(parts):
                 raise ValueError("voice_part_index must point at an existing message part")
+        if self.scene_mark is not None and self.scene_mark not in {"on", "off"}:
+            raise ValueError("scene_mark must be on, off, or None")
 
     def to_dict(self) -> dict[str, JSONValue]:
         return {
@@ -338,6 +343,7 @@ class DialogueResult:
             "context_version": self.context_version,
             "message_parts": list(self.message_parts),
             "voice_part_index": self.voice_part_index,
+            "scene_mark": self.scene_mark,
         }
 
     @classmethod
@@ -360,6 +366,7 @@ class DialogueResult:
                 else tuple(raw_parts)
             ),
             voice_part_index=value.get("voice_part_index"),
+            scene_mark=value.get("scene_mark"),
         )
 
     def to_json(self) -> str:
@@ -398,6 +405,8 @@ def split_voice_part(result: DialogueResult) -> tuple["DialogueResult | None", s
             model_route=result.model_route,
             context_version=result.context_version,
             message_parts=remaining,
+            # 场景标记属于这一轮，不属于被摘出去的那一段：摘剩的文字结果照旧带着它。
+            scene_mark=result.scene_mark,
         ),
         spoken,
     )

@@ -205,6 +205,7 @@ def test_the_conversation_page_shows_what_she_remembered_and_why():
     html = (DASHBOARD / "index.html").read_text(encoding="utf-8")
     assert "renderMemoryRecall" in js and "她这一轮想起了什么" in js
     assert "relationship_refs" in js and "retrieved_refs" in js, "常驻与按话题想起必须分别展示内容"
+    assert "working_set_refs" in js, "工作集每轮都注入，必须显示（2026-09-22 用户要求）"
     assert "describeMemoryReason" in js and "相关度" in js, "必须能看出为什么想起这一条"
     assert "三字重合" in js, "命中理由必须说人话，不能直接抛 trigram_overlap 这种内部串"
     assert "读这一段的原话" in js and "/api/fragment?id=" in js, "明细原文要能在这一轮里直接读"

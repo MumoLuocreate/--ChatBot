@@ -4,7 +4,7 @@
 清理是**独立的显式调用**（绝不走对话热路径）。
 
 键 = 模型 + 音色 + 要念的文本 + 语气指令 + 采样率的 sha256。同样的输入必然得到同样的
-键，所以 outbox 重入时 payload 里的路径是确定的（`历史TTS计划` §3.5）。
+键，所以 outbox 重入时 payload 里的路径是确定的（`doc/TTS-实施计划-20260914.md` §3.5）。
 """
 
 from __future__ import annotations

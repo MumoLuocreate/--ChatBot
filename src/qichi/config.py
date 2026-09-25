@@ -167,6 +167,9 @@ class MemorySettings:
     uncertain_as_fact: bool
     generated_text_as_user_evidence: bool
     recent_history_from_raw_events: bool
+    # 卡B④（2026-09-22）：常驻工作集的上限与 episode 年龄门。0 = 不按年龄退场。
+    working_set_max_tokens: int
+    working_set_episode_max_age_days: int
 
 
 @dataclass(frozen=True)
@@ -806,6 +809,8 @@ def _parse_memory(raw: Mapping[str, Any]) -> MemorySettings:
             "uncertain_as_fact",
             "generated_text_as_user_evidence",
             "recent_history_from_raw_events",
+            "working_set_max_tokens",
+            "working_set_episode_max_age_days",
         },
         "memory",
     )
@@ -832,6 +837,10 @@ def _parse_memory(raw: Mapping[str, Any]) -> MemorySettings:
         always_include_types=_strings(raw, "always_include_types", "memory"),
         retrieval_candidate_top_k=_integer(raw, "retrieval_candidate_top_k", "memory", minimum=1),
         episodic_top_k=_integer(raw, "episodic_top_k", "memory", minimum=1),
+        working_set_max_tokens=_integer(raw, "working_set_max_tokens", "memory", minimum=1),
+        working_set_episode_max_age_days=_integer(
+            raw, "working_set_episode_max_age_days", "memory", minimum=0
+        ),
         lifecycle_states=_strings(raw, "lifecycle_states", "memory"),
         correction_precedence=_bool(raw, "correction_precedence", "memory"),
         ambiguity_stays_candidate=_bool(raw, "ambiguity_stays_candidate", "memory"),

@@ -1,4 +1,4 @@
-# 引擎运行配置示例。密钥只从环境变量读取。
+# 角色新架构运行配置。密钥只从环境变量读取。
 app:
   timezone: Asia/Shanghai
   owner_qq_env: QICHI_OWNER_QQ
@@ -32,11 +32,11 @@ llm:
   base_url: https://api.deepseek.com/v1
   api_key_env: DEEPSEEK_API_KEY
   # 2026-09-16：主模型从 pro 切回 flash（用户裁定「全换 f 吧，p 的开销还是高」）。
-  # 支持这次切换的实测（同一段真脚本 25 轮副本，历史诊断）：
+  # 支持这次切换的实测（同一段真脚本 25 轮副本，doc/诊断-20260915-亲密长会话模板化.md）：
   # flash（默认含思考）均 31 字、长说明句 2%、最高频骨架只 ×3、每轮 6.0 秒；
   # 同条件 pro 关思考是均 56 字、29%、×6、2.4 秒。
   # 反面同样记在案：flash 更爱点名重复（三臂 4 次 vs pro 1 次；09-13 消息占比 39% vs 13%），
-  # 因此这次切换带着判据走，见历史方案。
+  # 因此这次切换带着判据走，见 doc/方案-20260916-全量切flash.md。
   # 09-13 的机制结论仍然成立，也是当初换 pro 的原因：思考 ≈「注意到重复」的能力——
   # flash 会用它点名对方，pro 关掉思考后没有这个能力就复读自己（41%），
   # pro 开思考既不复读也不点名，但每轮 27 秒。
@@ -75,12 +75,13 @@ llm:
   normal_reply_calls: 1
 
 persona:
-  # 运行时角色核心：整条对话热路径唯一注入的角色文本；其它文档永远不会被注入。
-  # 仓库只带一份通用示例。请复制成你自己的文件（例如 doc/我的角色.md）再改；
-  # 路径必须落在项目根目录内。缺失或非法时装配直接失败，不会退回默认人设。
+  # 整条对话热路径唯一注入的角色文本。默认指向随仓库分发的通用占位模板；
+  # 请复制成你自己的角色文件（例如 doc/我的角色.md）后把这一行指过去。
   system_prompt_file: doc/运行时角色核心.example.md
-  # 下面三项是历史配置键，当前引擎不读取，保留只为兼容既有配置文件。
-  reference_files: []
+  reference_files:
+    - doc/人设-角色.md
+    - doc/用户画像.md
+    - doc/角色外貌设定.md
   inject_reference_files_verbatim: false
   prompt_mode: thin
 
@@ -150,6 +151,13 @@ memory:
   always_include_types: [agreement, correction]
   retrieval_candidate_top_k: 24
   episodic_top_k: 12
+  # 卡B④（2026-09-22 用户裁定）：常驻工作集的上限与 episode 年龄门。
+  # 只有 episode 会因年龄退场——偏好、约定、纠正是常驻关系状态，再老也不退。
+  # 退场不是删除：记录/证据/索引都在，仍可被检索按相关度带回来。
+  # working_set_episode_max_age_days: 14 表示「两周内发生的经历每轮都在场」；
+  # 设为 0 则完全不按年龄退场（回到旧行为）。
+  working_set_max_tokens: 6000
+  working_set_episode_max_age_days: 14
   lifecycle_states: [candidate, active, superseded, rejected, expired]
   correction_precedence: true
   ambiguity_stays_candidate: true
@@ -190,14 +198,21 @@ decision_authority:
 initiative:
   enabled: true
   # 用户每次发言都会重新计时；每 60 分钟是一次模型可跳过的尝试，不是强制发送。
+  # 间隔被 InitiativePolicy 固定为 60（装配时会给别的值直接报错）；2026-09-19 实测
+  # 开口前空档中位 120 分钟、p90 600 分钟、最长 1081 分钟，放大的主因是下面的上限。
   idle_attempt_minutes: 60
   # Stop competing for attention after this many successful initiative sends
   # without a new owner message. A new owner message resets the sequence.
-  max_unanswered_attempts: 2
+  # 2026-09-19 实测：allow_model_to_skip 实际空转（115 次尝试里模型 0 次跳过），
+  # 所以「两条就不发了」完全是这个上限造成的，不是她不想说。2 → 5 让一次无人回应的
+  # 空档里还能再试几次（60 分钟 × 5 = 5 小时），不再一停就静十几个小时。
+  max_unanswered_attempts: 5
   reset_on_user_message: true
   use_same_dialogue_engine: true
   allow_model_to_skip: true
-  # 每日上限尚未设置；主动消息在北京时间 23:00（含）到次日 08:00（不含）静默。
+  # 每日上限被 InitiativePolicy 明确要求保持未设置（设了值装配会拒绝）；节流靠
+  # 静默时段与上面的无回应上限。
+  # 主动消息在北京时间 23:00（含）到次日 08:00（不含）静默。
   daily_send_limit: null
   quiet_hours_local: "23:00-08:00"
   cancel_if_conversation_changed: true
@@ -229,7 +244,7 @@ vision:
 net:
   # 外部检索（V4）。**默认关闭**：关着时不建客户端、不声明工具，行为与今天逐字一致。
   # 2026-09-13 用户裁定：后端用 Tavily；不主动查（主动消息里不给工具）；
-  # 带图轮不查——她必须先问「要不要我去查」，对方同意后才在下一轮查；
+  # 带图轮不查——她必须先问「要不要我去查」，用户同意后才在下一轮查；
   # 识图「稳定两周」的前置由用户当场豁免。
   # 还需要两个 key：TAVILY_API_KEY（文本，Tavily 免费档 1,000 credits/月）与
   # SERPAPI_API_KEY（图搜，免费档 1,000 次/月）。两个都在用户环境里。
@@ -252,20 +267,20 @@ net:
   image_api_key_env: SERPAPI_API_KEY
   image_max_matches: 5
   # 宽限窗口：新图到达后，之后多少轮内还能把它从本地存档重挂（供「先问再查」）。
-  # 2026-09-14 真机教训：一轮太短——等对方再提起时，图早已不在窗口里。
+  # 2026-09-14 真机教训：一轮太短——用户隔了六轮才说「你查一下这张图」，图早就不在窗口里了。
   image_carry_turns: 6
 
 voice:
-  # 语音合成（TTS）。**默认关闭**：关着时不建客户端、不声明能力、行为与今天逐字一致。
+  # 角色的嗓子（TTS）。**默认关闭**：关着时不建客户端、不声明能力、行为与今天逐字一致。
   # 2026-09-14 用户裁定 1a：走阿里云百炼「声音设计」，音色从零造、不克隆。
   # 回滚就是这一行改回 false + 重启。
   enabled: true
   base_url: https://dashscope.aliyuncs.com/api/v1
   api_key_env: DASHSCOPE_API_KEY
-  # 音色身份：由你在供应商侧设计/选定一次，然后固定写在这里，运行时不再重新设计。
-  # synth 模型必须与设计时用的 target_model 一致。下面这个值必须换成你自己的。
+  # P0 冻结下来的音色身份：设计一次（那是掷骰子，见 doc/TTS-实施计划-20260914.md §2.17），
+  # 运行时只用这一个，不再重新设计。synth 模型必须与设计时的 target_model 一致。
   model: qwen3-tts-vd-2026-01-26
-  voice_id: REPLACE_WITH_YOUR_OWN_VOICE_ID
+  voice_id: qwen-tts-vd-qichi_cast2-voice-20260914182133631-9160
   # 单段上限：超过就退回文字，不截断（§2.35）。
   max_chars_per_utterance: 120
   synthesize_timeout_seconds: 12

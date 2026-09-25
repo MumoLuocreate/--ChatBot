@@ -97,7 +97,7 @@ class Sender:
 
         绝不与 text 共用：payload 形状不同，create_intent 会直接判成
         "operation_key immutable intent identity conflict"（2026-09-14，
-        见历史TTS计划 §3.5）。
+        见 doc/TTS-实施计划-20260914.md §3.5）。
         """
 
         return str(uuid5(NAMESPACE_URL, f"qichi:outbox:record:{event_id}"))

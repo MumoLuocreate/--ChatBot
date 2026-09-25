@@ -5,7 +5,7 @@ r"""切换 flash 之后的三条命题复核（只读、不调用模型、不改
     .venv\Scripts\python.exe scripts\switch_verify.py
     .venv\Scripts\python.exe scripts\switch_verify.py --switch 2026-09-15T18:15:10 --window 200
 
-判据（先写判据再动手，见历史方案 §2）：
+判据（先写判据再动手，见 doc/方案-20260916-全量切flash.md §2）：
 
 命题 A：flash 时代她「点名重复」的比率不高于 pro 时代。
   判别观测：等量窗口内她已发送消息里的点名条数占比（词表代理：重复|又说一遍|复述|模板|旧话|翻出来）

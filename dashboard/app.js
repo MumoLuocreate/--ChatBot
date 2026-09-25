@@ -380,8 +380,13 @@
     heading.className = "recall-block-heading";
     heading.textContent = "她这一轮想起了什么";
     wrap.append(heading);
+    // 2026-09-22：工作集也要显示。它每轮都注入，只是按相关度排序、超预算时才丢尾部的条目，
+    // 所以它不是「按话题想起的」，而是「一直在场但会被压缩」。之前面板漏了它，
+    // 用户看到的常驻内容比实际少得多。
     const groups = [
-      ["每一轮都在的记忆（偏好与约定，不需要触发）", item.relationship_refs, "无", false],
+      ["每一轮都在的记忆（约定与纠正，不需要触发）", item.relationship_refs, "无", false],
+      ["一直在场的工作集（偏好与近期经历，按相关度排序、超预算才丢尾部）",
+        item.working_set_refs, "这一轮工作集是空的", false],
       ["因为你这句里出现了相关词才想起的", item.retrieved_refs || item.candidate_refs,
         "这一轮没有按话题想起别的记忆", true],
     ];

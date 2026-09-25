@@ -3,12 +3,12 @@ from __future__ import annotations
 import inspect
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 from uuid import NAMESPACE_URL, uuid5
 
-from qichi.domain.events import ConversationEvent
+from qichi.domain.events import ConversationEvent, quote_is_verbatim
 from qichi.domain.memory_details import MemoryDetailDraft, MemoryFragmentSpec
 from qichi.dialogue.llm_client import (
     LLMAuthenticationError,
@@ -120,7 +120,7 @@ _DETAIL_FIELDS = frozenset(
 # event_id 与 role 在场：溯源锚点是 detail 自己的 source_event_id 与 exact_quote。
 # 2026-09-16：旧版这里另立了一个 {event_id, role} 的**允许**集合，而抽取提示词只声明了
 # 一条通用 evidence 规则，模型照提示词写四个字段 → 解析器判「未知字段」→ 整段窗口被隔离、
-# 永久进不了记忆（真机 seq 7306-7320，见历史诊断）。
+# 永久进不了记忆（真机 seq 7306-7320，见 doc/诊断-20260916-记忆抽取证据契约冲突.md）。
 _DETAIL_EVIDENCE_REQUIRED_FIELDS = frozenset({"event_id", "role"})
 _CANDIDATE_EVIDENCE_ROLES = {
     # A source plus later user confirmation is retained for compatibility
@@ -583,6 +583,25 @@ class MemoryExtractor:
             # candidate evidence role actor is inconsistent / episode requires mumo evidence）。
             # 现在只在**确实什么都没剩下**时才判失败。
             if not details and fragment is None:
+                if not any(event.actor == "mumo" for event in events):
+                    # 2026-09-24（用户裁定「2选甲」的第一半）：**窗口里没有任何用户事件**时，
+                    # 「整窗全不合法」是正常结局，而不是异常。
+                    # 真机形状：她单独锚定的窗口（她主动开口，前置事件是平台主动发起）里她复述
+                    # 了一条已有约定 → 模型产出一条复述项 → 该项校验不过 → 旧行为把整窗判失败，
+                    # 重试两次后停在 failed、next_retry 为 None，记忆水位被永久钉在 10441，
+                    # 其后 4 条事件进不了她的记忆。
+                    # 收口成空结果：候选与复述都是空的（worker 会据此记 empty_result），
+                    # 丢掉的条数仍在诊断里，所以这条路径事后仍可辨认。
+                    # 反向守卫（同一处代码的判据③）：窗口里只要**有一句用户的话**，
+                    # 整窗全不合法**仍必须** fail-closed，不许拿这条去放宽正常窗口。
+                    return (
+                        (),
+                        (),
+                        diagnostics,
+                        MemoryOutcome("no_persistent_memory", "nothing_new"),
+                        None,
+                        (),
+                    )
                 raise _AllItemsInvalid(
                     first_item_error or "all proposed memory items are invalid",
                     {"parse_error_code": "all_items_invalid", **diagnostics},
@@ -716,7 +735,10 @@ class MemoryExtractor:
             if actor in {"mumo", "qichi"} and source.actor != actor:
                 raise ValueError("detail actor does not match source event")
             quote = self._text(raw["exact_quote"], "exact_quote", _MAX_QUOTE_CHARS)
-            if source.text is None or quote not in source.text:
+            # 逐字判定统一在 domain.events.quote_is_verbatim：忽略两端句读与空白、
+            # 中间必须逐字一致；伪造的引文仍然被拒。（2026-09-22 真机：模型抄她的
+            # 原话时在句尾补标点，把记忆水位钉死了 8 小时。）
+            if not quote_is_verbatim(quote, source.text):
                 raise ValueError("detail exact quote is absent from source event")
             if source_event_id not in seen:
                 raise ValueError("detail source event must be included in evidence")
@@ -1056,7 +1078,7 @@ class MemoryExtractor:
             if source.actor != actor:
                 raise ValueError("evidence actor does not match source event")
             quote = self._text(raw["exact_quote"], "exact_quote", _MAX_QUOTE_CHARS)
-            if source.text is None or quote not in source.text:
+            if not quote_is_verbatim(quote, source.text):
                 raise ValueError("exact quote is absent from source event")
             identity = (event_id, quote)
             if identity in identities:

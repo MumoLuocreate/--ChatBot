@@ -54,12 +54,12 @@ def _client(base: str, **kwargs) -> TavilySearchClient:
 @pytest.mark.asyncio
 async def test_a_successful_search_keeps_sources_and_order(tavily_stub):
     base, calls, responses = tavily_stub
-    responses["仲恺学院"] = (
+    responses["示例学院"] = (
         200,
         {
-            "query": "仲恺学院",
+            "query": "示例学院",
             "results": [
-                {"title": "仲恺农业工程学院", "url": "https://example.com/a", "content": "  农业  工程  "},
+                {"title": "示例学院", "url": "https://example.com/a", "content": "  农业  工程  "},
                 {"title": "百科", "url": "https://example.com/b", "content": "历史沿革"},
                 {"title": "没有网址", "content": "应被跳过"},
             ],
@@ -67,12 +67,12 @@ async def test_a_successful_search_keeps_sources_and_order(tavily_stub):
     )
     client = _client(base)
     try:
-        outcome = await client.search("  仲恺学院  ")
+        outcome = await client.search("  示例学院  ")
     finally:
         await client.close()
 
     assert outcome.ok is True
-    assert outcome.query == "仲恺学院"
+    assert outcome.query == "示例学院"
     assert [item.url for item in outcome.results] == ["https://example.com/a", "https://example.com/b"]
     assert outcome.results[0].content == "农业 工程"
     assert calls[0]["auth"] == "Bearer tvly-test"
@@ -175,7 +175,7 @@ def test_a_query_that_is_empty_or_too_long_is_a_programming_error():
 
 def test_the_external_block_states_provenance_and_failure_is_honest():
     ok = SearchOutcome(
-        query="仲恺学院",
+        query="示例学院",
         results=(),
         degraded_reason=None,
         elapsed_ms=12,
@@ -183,7 +183,7 @@ def test_the_external_block_states_provenance_and_failure_is_honest():
     block = render_external_block(ok, now=NOW)
     assert "不可信" in block or "不是本机事实" in block
 
-    failed = SearchOutcome(query="仲恺学院", results=(), degraded_reason="timeout", elapsed_ms=900)
+    failed = SearchOutcome(query="示例学院", results=(), degraded_reason="timeout", elapsed_ms=900)
     blocked = render_external_block(failed, now=NOW)
     assert "timeout" in blocked
     assert "没查到" in blocked

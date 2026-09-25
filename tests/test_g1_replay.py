@@ -247,8 +247,8 @@ def test_vision_and_external_tool_capabilities_follow_actual_results(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reply", [
-    "我确实偏向你，承认得很干脆。",
-    "那我就接下去，也承认我偏向你。",
+    "我当然偏心你，承认得很干脆。",
+    "那我接住，也承认我偏心你。",
 ])
 async def test_same_dialogue_engine_preserves_intimacy_and_shared_imagination_verbatim(reply):
     llm = FakeLLM(reply)
@@ -267,10 +267,10 @@ async def test_same_dialogue_engine_preserves_intimacy_and_shared_imagination_ve
 
 @pytest.mark.asyncio
 async def test_offline_diagnostic_snapshot_observes_real_outcome_without_rewriting_it():
-    llm = FakeLLM("我偏向你。")
+    llm = FakeLLM("我偏心你。")
     engine = DialogueEngine(llm, OutputGuard(UnitCounter(), 100),
                             ResponseProtocol(face_keys=set(), reaction_keys=set()))
-    role_messages = (ModelMessage("system", "薄角色核心"), ModelMessage("user", "你会偏向我吗？"))
+    role_messages = (ModelMessage("system", "薄角色核心"), ModelMessage("user", "你会偏心我吗？"))
     inp = DialogueInput("owner-private", ("e10",), "M9", None, 1, role_messages,
                         datetime(2026, 8, 28, tzinfo=timezone.utc), CapabilityManifest({}), "dialogue")
     outcome = await engine.generate(inp)

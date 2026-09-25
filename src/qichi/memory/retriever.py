@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Iterable, Literal, Mapping, TypeAlias
 from uuid import uuid4
 
-from qichi.domain.events import ConversationEvent
+from qichi.domain.events import ConversationEvent, quote_is_verbatim
+from qichi.memory.dates import names_a_time_term
 from qichi.domain.memory import MemoryRecord
 from qichi.storage.database import Database
 from qichi.storage.event_repository import EventRepository
@@ -18,6 +20,16 @@ SearchMode: TypeAlias = Literal["fts5_trigram", "like_short_query", "like_degrad
 _MAX_CANDIDATES = 24
 _MAX_CONTEXT_CANDIDATES = 12
 _MAX_TRIGRAMS = 64
+# 卡C 第二道闸：一个窗口在**多少条 active episode** 里出现过，超过这个数就不许用它放宽。
+# 实测（2026-09-22，active 记忆）：团建=2、校区=2；今天=15、有点=18、我们=40。
+# 第一道闸（只放宽到 episode）挡的是偏好侧的偶然重合（P116），这道闸挡 episode 侧自己的泛词。
+_MAX_WINDOW_DOCUMENT_FREQUENCY = 5
+
+
+def _is_cjk_pair(value: str) -> bool:
+    """两个字且都是汉字。ASCII／标点的两字片段是噪音，不进 LIKE 模式。"""
+
+    return len(value) == 2 and all("\u4e00" <= char <= "\u9fff" for char in value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,8 +39,8 @@ class MemoryRetrievalResult:
     evidence_events: Mapping[str, ConversationEvent]
     search_mode: SearchMode
     degraded_reason: str | None
-    scores: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
-    reasons: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    scores: Mapping[str, int] = MappingProxyType({})
+    reasons: Mapping[str, str] = MappingProxyType({})
     confirmation_candidates: tuple[MemoryRecord, ...] = ()
 
     def __post_init__(self) -> None:
@@ -118,6 +130,18 @@ class MemoryRetriever:
         terms = self._query_terms(query, query_terms)
         short_terms = tuple(term for term in terms if len(term) < 3)
         long_terms = tuple(term for term in terms if len(term) >= 3)
+        # 卡C：两字窗口只放宽到 episode（结构性闸门，不用词表）。指向一件事是"发生过的事"，
+        # 而 P116 那条误召回的目标是 preference——把偏好排除在放宽之外，红线与需求同时成立。
+        windows = self._query_bigrams(long_terms)
+        # 卡C 第一步：时间指示词不是「指向」——它们指时间（「明天」更是指未来），
+        # 而指向一件事用的是命名实体。词频分不开这两者（实测「明天」的 episode 出现
+        # 次数与三个真目标相同），所以这里按**语言类别**排除。
+        if windows:
+            windows = tuple(item for item in windows if not names_a_time_term(item))
+        if windows:
+            # 卡C 第二道闸：泛词（在很多 episode 里出现过的）没有指向性，不许用来放宽。
+            frequent = self._frequent_windows(windows, at_utc)
+            windows = tuple(item for item in windows if item not in frequent)
 
         if not long_terms:
             memory_ids = self._like_candidate_ids(conversation_id, short_terms, at_utc)
@@ -126,15 +150,20 @@ class MemoryRetriever:
         elif self._supports_fts5_trigram():
             fts_ids = self._fts_candidate_ids(conversation_id, long_terms, at_utc)
             short_ids = self._like_candidate_ids(conversation_id, short_terms, at_utc)
-            memory_ids = tuple(sorted(set(fts_ids) | set(short_ids)))
+            window_ids = self._like_candidate_ids(
+                conversation_id, windows, at_utc, record_type="episode"
+            )
+            memory_ids = tuple(sorted(set(fts_ids) | set(short_ids) | set(window_ids)))
             search_mode = "fts5_trigram"
             degraded_reason = None
         else:
-            memory_ids = self._like_candidate_ids(
+            memory_ids = tuple(sorted(set(self._like_candidate_ids(
                 conversation_id,
                 short_terms + self._query_trigrams(long_terms),
                 at_utc,
-            )
+            )) | set(self._like_candidate_ids(
+                conversation_id, windows, at_utc, record_type="episode"
+            ))))
             search_mode = "like_degraded"
             degraded_reason = "SQLite FTS5 trigram tokenizer is unavailable"
 
@@ -153,7 +182,9 @@ class MemoryRetriever:
                 )
                 if include_sensitive or record.privacy_class == "ordinary"
             )
-        ranked, all_scores, all_reasons = self._rank_candidates(loaded, terms, query)
+        ranked, all_scores, all_reasons = self._rank_candidates(
+            loaded, terms, query, windows=windows
+        )
         candidates = ranked[: self.candidate_limit]
         selected_ids = {record.memory_id for record in candidates}
         scores = {key: all_scores[key] for key in selected_ids}
@@ -207,8 +238,18 @@ class MemoryRetriever:
 
     @classmethod
     def _rank_candidates(
-        cls, records: tuple[MemoryRecord, ...], terms: tuple[str, ...], query: str
+        cls,
+        records: tuple[MemoryRecord, ...],
+        terms: tuple[str, ...],
+        query: str,
+        *,
+        windows: tuple[str, ...] = (),
     ) -> tuple[tuple[MemoryRecord, ...], Mapping[str, int], Mapping[str, str]]:
+        """卡C：windows 是两字窗口，**只对 episode 生效**。
+
+        否则两字窗口会把「1 处偶然重合」放大成「≥2 处」，绕过下面那道
+        「单个偶然重合不展开详细证据」的门槛（P116，软-tone 那条红线测试）。
+        """
         ranked: list[tuple[int, int, datetime, str, MemoryRecord, str]] = []
         scores: dict[str, int] = {}
         reasons: dict[str, str] = {}
@@ -216,8 +257,11 @@ class MemoryRetriever:
         for record in records:
             fact = record.normalized_fact
             quotes = tuple(item.exact_quote for item in record.memory_evidence)
-            fact_hits = sum(term in fact for term in terms)
-            quote_hits = sum(any(term in quote for quote in quotes) for term in terms)
+            effective = (
+                terms + windows if record.type == "episode" and windows else terms
+            )
+            fact_hits = sum(term in fact for term in effective)
+            quote_hits = sum(any(term in quote for quote in quotes) for term in effective)
             trigram_fact_hits = sum(fragment in fact for fragment in trigrams)
             trigram_quote_hits = sum(
                 any(fragment in quote for quote in quotes) for fragment in trigrams
@@ -326,11 +370,17 @@ class MemoryRetriever:
             self.database.connection.execute(f"DROP TABLE IF EXISTS temp.{table_name}")
 
     def _like_candidate_ids(
-        self, conversation_id: str, terms: tuple[str, ...], at_utc: datetime
+        self,
+        conversation_id: str,
+        terms: tuple[str, ...],
+        at_utc: datetime,
+        *,
+        record_type: str | None = None,
     ) -> tuple[str, ...]:
         patterns = tuple(f"%{self._escape_like(term)}%" for term in terms)
         if not patterns:
             return ()
+        type_clause = "" if record_type is None else " AND m.type = ?"
         match_sql = " OR ".join(
             "m.normalized_fact LIKE ? ESCAPE '\\' OR me.exact_quote LIKE ? ESCAPE '\\'"
             for _ in patterns
@@ -338,6 +388,9 @@ class MemoryRetriever:
         parameters: list[object] = [conversation_id, at_utc.isoformat(), at_utc.isoformat()]
         for pattern in patterns:
             parameters.extend((pattern, pattern))
+        # 类型占位符在 WHERE 末尾，位置绑定必须跟着放最后。
+        if record_type is not None:
+            parameters.append(record_type)
         rows = self.database.connection.execute(
             "SELECT DISTINCT m.memory_id FROM memory_records AS m "
             "JOIN memory_evidence AS me ON me.memory_id = m.memory_id "
@@ -345,7 +398,7 @@ class MemoryRetriever:
             "WHERE e.conversation_id = ? AND m.status = 'active' "
             "AND m.valid_from_utc <= ? "
             "AND (m.valid_until_utc IS NULL OR m.valid_until_utc >= ?) "
-            f"AND ({match_sql}) ORDER BY m.memory_id",
+            f"AND ({match_sql}){type_clause} ORDER BY m.memory_id",
             tuple(parameters),
         ).fetchall()
         return tuple(row["memory_id"] for row in rows)
@@ -385,7 +438,7 @@ class MemoryRetriever:
                     raise ValueError("memory evidence actor does not match source event")
                 if source.occurred_at_utc != evidence.occurred_at_utc:
                     raise ValueError("memory evidence time does not match source event")
-                if source.text is None or evidence.exact_quote not in source.text:
+                if not quote_is_verbatim(evidence.exact_quote, source.text):
                     raise ValueError("memory evidence exact quote is absent from source event")
                 events[source.event_id] = source
         return MappingProxyType(events)
@@ -402,6 +455,79 @@ class MemoryRetriever:
                 if len(result) == _MAX_TRIGRAMS:
                     break
         return tuple(result)
+
+    @staticmethod
+    def _query_bigrams(terms: tuple[str, ...]) -> tuple[str, ...]:
+        """两字窗口（只取汉字对）：卡C「指向」用。
+
+        2026-09-22 实测：FTS5 的 trigram **结构上索引不了 2 字关键词**，而用户指向一件事
+        时用的词多半就是两字（团建/校区/文档）。此前 ≥3 字的词走 FTS、<3 字的走 LIKE，
+        而 app._memory_query_terms 返回的是整句原文，于是 <3 字那一路永远是空的——
+        生产副本实测：整句指向候选 0 条，只给词「团建」2 条且命中。
+
+        **只许放宽到 episode**（见 retrieve() 与 _rank_candidates 的注释）：两字窗口会把
+        「1 处偶然重合」放大成「≥2 处」，从而绕过 P116「单个偶然重合不展开详细证据」；
+        指向的对象是"发生过的事"，而 P116 的误召回目标是一条 preference。
+        """
+        seen: set[str] = set()
+        result: list[str] = []
+        # 纯字母/数字的连续串同样是"指向"的关键词（TTS、AI）。只取汉字对是第一版的漏洞：
+        # 用户的四个例子里就有一个是纯字母，结构上永远进不来（对照实测 TTS 那格漏掉）。
+        for term in terms:
+            for run in re.findall(r"[A-Za-z0-9]{2,}", term):
+                if run not in seen and len(result) < _MAX_TRIGRAMS:
+                    seen.add(run)
+                    result.append(run)
+        positions = [0] * len(terms)
+        while len(result) < _MAX_TRIGRAMS:
+            progressed = False
+            for term_index, term in enumerate(terms):
+                while positions[term_index] <= len(term) - 2:
+                    start = positions[term_index]
+                    positions[term_index] += 1
+                    fragment = term[start : start + 2]
+                    if not _is_cjk_pair(fragment) or fragment in seen:
+                        continue
+                    seen.add(fragment)
+                    result.append(fragment)
+                    progressed = True
+                    break
+                if len(result) == _MAX_TRIGRAMS:
+                    break
+            if not progressed:
+                break
+        return tuple(result)
+
+    def _frequent_windows(
+        self, windows: tuple[str, ...], at_utc: datetime
+    ) -> frozenset[str]:
+        """太常见的窗口（返回集）；它们不许用来放宽检索（卡C 第二道闸）。
+
+        判据算在**被放宽的那一侧**（episode）：一个两字词若在很多条 episode 里出现过，
+        它就没有指向性——2026-09-22 多情景对照里「今天有点累」把 4 条退场经历拉进了提示，
+        每一条都只是碰巧共用「今天／有点」这种泛词。实测 active 记忆里 团建=2、校区=2，
+        而 今天=15、有点=18、我们=40。
+        """
+
+        if not windows:
+            return frozenset()
+        placeholders = ",".join("(?)" for _ in windows)
+        rows = self.database.connection.execute(
+            "WITH qw(w) AS (VALUES " + placeholders + ") "
+            "SELECT qw.w AS w, COUNT(DISTINCT m.memory_id) AS n "
+            "FROM qw JOIN memory_records AS m ON m.type = 'episode' AND m.status = 'active' "
+            "AND m.valid_from_utc <= ? "
+            "AND (m.valid_until_utc IS NULL OR m.valid_until_utc >= ?) "
+            "AND (m.normalized_fact LIKE '%'||qw.w||'%' "
+            "     OR EXISTS (SELECT 1 FROM memory_evidence AS me "
+            "                WHERE me.memory_id = m.memory_id "
+            "                  AND me.exact_quote LIKE '%'||qw.w||'%')) "
+            "GROUP BY qw.w",
+            (*windows, at_utc.isoformat(), at_utc.isoformat()),
+        ).fetchall()
+        return frozenset(
+            row["w"] for row in rows if row["n"] > _MAX_WINDOW_DOCUMENT_FREQUENCY
+        )
 
     @staticmethod
     def _query_trigrams(terms: tuple[str, ...]) -> tuple[str, ...]:

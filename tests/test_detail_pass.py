@@ -104,6 +104,7 @@ async def test_an_invalid_entry_is_dropped_and_counted_without_breaking_the_orde
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
 async def test_malformed_output_fails_closed():
     events = (event(1),)
     for response in ("", "not json", "[]", json.dumps({"details": "no"}, ensure_ascii=False),

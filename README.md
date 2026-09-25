@@ -21,7 +21,7 @@
 | `dashboard/` | 只读观测面板前端（静态资源） |
 | `migrations/` | SQLite 迁移 |
 | `config.example.yaml` | 配置示例 |
-| `doc/运行时角色核心.example.md` | **通用占位角色**（不是可用人设） |
+| `doc/运行时角色核心.example.md` | **通用占位角色模板**（不是可用人设） |
 | `doc/架构说明.md` | 架构与链路说明 |
 
 ---
@@ -33,7 +33,7 @@
 | # | 要补的东西 | 必需性 | 怎么补 |
 | --- | --- | --- | --- |
 | 1 | **你自己的角色核心** `doc/你的角色.md` | 必需 | 复制 `doc/运行时角色核心.example.md` 再改写；见第二节 |
-| 2 | **配置文件** `config.yaml` | 必需 | 复制 `config.example.yaml`，改 `persona.system_prompt_file` 等 |
+| 2 | **配置文件** `config.yaml` | 必需 | 复制 `config.example.yaml`，填模型 / QQ / 通道与密钥环境变量 |
 | 3 | **环境变量（密钥）** | 必需 | 见第五节 |
 | 4 | **tokenizer 产物** `runtime/model-cache/v4-tokenizer.json` | 生产装配必需 | 按 manifest 钉住的 URL 下载；见 1.1 |
 | 5 | **供应商能力证据** `runtime/<主模型名>-capability.json` | 生产装配必需 | 自己实测后写一份；见 1.2 |

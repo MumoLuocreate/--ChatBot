@@ -4,7 +4,8 @@ import json
 import sqlite3
 import hashlib
 import math
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import quote
@@ -60,6 +61,49 @@ _TRACE_CANCELLATION_CATEGORIES = frozenset({
     "dispatch_guard_rejected", "newer_input_after_generation", "newer_input_after_poke",
 })
 _TRACE_OUTBOX_STATUSES = frozenset({"pending", "dispatched", "sent", "unknown", "failed"})
+# DeepSeek 官方定价（2026-09-22 抄自 https://api-docs.deepseek.com/zh-cn/quick_start/pricing）。
+# 单位：元 / 百万 tokens；"空闲"是高峰价的一半。
+# 高峰时段：北京时间 周一至周五（不含中国法定节假日）9:00-12:00、14:00-18:00。
+# 官方另注明：模型名 deepseek-v4-flash 已下线（仍可调用、按 Flash 计价），新名是 deepseek-flash。
+_LLM_PRICES: dict[str, dict[str, tuple[float, float]]] = {
+    # 模型名/别名 -> {kind: (空闲价, 高峰价)}
+    "deepseek-flash": {
+        "hit": (0.02, 0.04), "miss": (1.0, 2.0), "output": (4.0, 8.0),
+    },
+    "deepseek-v4-flash": {
+        "hit": (0.02, 0.04), "miss": (1.0, 2.0), "output": (4.0, 8.0),
+    },
+    "deepseek-v4-pro": {
+        "hit": (0.15, 0.30), "miss": (4.5, 9.0), "output": (13.5, 27.0),
+    },
+}
+
+
+def _is_peak_hour(when: datetime) -> bool:
+    """北京时间工作日 9:00-12:00、14:00-18:00 为高峰，其余按空闲计价。"""
+
+    local = when.astimezone(ZoneInfo("Asia/Shanghai"))
+    if local.weekday() >= 5:
+        return False
+    return 9 <= local.hour < 12 or 14 <= local.hour < 18
+
+
+def _price_cny(model: object, kind: str, when: datetime, tokens: int) -> float:
+    """按官方单价折算金额；模型未知或 tokens 非正时返回 0（绝不猜）。"""
+
+    if not isinstance(tokens, int) or tokens <= 0:
+        return 0.0
+    table = _LLM_PRICES.get(model if isinstance(model, str) else "")
+    if table is None:
+        return 0.0
+    pair = table.get(kind)
+    if pair is None:
+        return 0.0
+    idle, peak = pair
+    rate = peak if _is_peak_hour(when) else idle
+    return round(tokens / 1_000_000 * rate, 4)
+
+
 _TRACE_FIELD_SCHEMAS: dict[str, tuple[object, ...]] = {
     "attempt_count": ("uint",),
     "cancellation_category": ("enum", _TRACE_CANCELLATION_CATEGORIES, False),
@@ -78,6 +122,12 @@ _TRACE_FIELD_SCHEMAS: dict[str, tuple[object, ...]] = {
     "has_quote_target": ("bool",),
     "input_budget_tokens": ("uint",),
     "input_tokens": ("uint",),
+    # 2026-09-22 成本观测：本轮提示字符数，以及它与上一轮逐字相同的公共前缀字符数
+    # （只有数字，没有正文）。与 cache_hit_tokens/input_tokens 并排看即可判定命中偏低
+    # 是提示结构问题还是供应商侧的判定差异。
+    "prompt_chars": ("uint",),
+    "prompt_prefix_chars": ("uint",),
+    "prompt_covers_previous": ("bool",),
     "memory_detail_count": ("uint",),
     "memory_detail_fragments": ("id_list", 64),
     # 2026-09-12 T1：钥匙（授权）与定位分开记。key 是冻结计划 §2.1 的那把钥匙，
@@ -290,16 +340,37 @@ def _marker_conflict_reason(value: Mapping[str, object]) -> str:
 class DashboardService:
     """Read operational state from SQLite without any write-capable handle."""
 
-    def __init__(self, database_path: str | Path, marker_path: str | Path, runtime_info: Mapping[str, object] | None = None, *, lock_path: str | Path | None = None, pid_probe: object | None = None, clock: object | None = None, code_root: str | Path | None = None, local_zone: tzinfo | None = None):
+    def __init__(self, database_path: str | Path, marker_path: str | Path, runtime_info: Mapping[str, object] | None = None, *, lock_path: str | Path | None = None, pid_probe: object | None = None, clock: object | None = None, code_root: str | Path | None = None):
         self.database_path = Path(database_path)
         self.marker_path = Path(marker_path)
         self.runtime_info = dict(runtime_info or {})
         self.lock_path = Path(lock_path) if lock_path is not None else None
         self.pid_probe = pid_probe if callable(pid_probe) else self._default_pid_probe
         self.clock = clock if callable(clock) else lambda: datetime.now(timezone.utc)
-        # 日期分桶必须与引擎同源；面板没拿到配置时区时才退回本机时区（最后手段）。
-        self.local_zone = local_zone if local_zone is not None else datetime.now().astimezone().tzinfo
         self.code_root = Path(code_root) if code_root is not None else PROJECT_ROOT
+
+    def _memory_stall_reason(self, connection) -> str | None:
+        """整合是不是卡住了（2026-09-22）。
+
+        只在**存在终态失败的整合任务**时报警。单看「水位落后多少条」会误报：一段长时间
+        连续的对话本来就只在静默 30 分钟后才整合一次，落后几百条是正常的。终态失败则一定
+        是可处理的异常——真机上一条约文里的坏标点把水位钉死 8 小时，而当时**没有任何地方**
+        会提醒，是用户主动问起才被发现。
+        """
+
+        try:
+            row = connection.execute(
+                "SELECT start_sequence, end_sequence, failure_category FROM memory_session_jobs "
+                "WHERE status='failed' ORDER BY updated_at_utc LIMIT 1"
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        category = row["failure_category"] or "unknown"
+        return "记忆整合卡住：有终态失败的任务（seq %s-%s，类别 %s），等重开" % (
+            row["start_sequence"], row["end_sequence"], category
+        )
 
     def snapshot(self, *, page: int = 1, limit: int = 50, memory_page: int = 1, memory_limit: int = 50, memory_status: str | None = None) -> dict[str, object]:
         page = max(1, int(page)); limit = min(100, max(1, int(limit)))
@@ -331,6 +402,13 @@ class DashboardService:
         except (OSError, sqlite3.Error) as error:
             result["health"] = {"ok": False, "reason": f"database unavailable: {type(error).__name__}"}
             return result
+        stall_reason = self._memory_stall_reason(connection)
+        if stall_reason is not None:
+            # 两条理由都要留住：marker 不健康（build 不一致等）时若被卡住理由顶掉，
+            # 反而会掩盖另一条更该看见的异常。
+            current = result["health"].get("reason")
+            combined = stall_reason if not current or current == "ok" else f"{current}；{stall_reason}"
+            result["health"] = {"ok": False, "reason": combined}
         try:
             try:
                 # Keep every projection in one SQLite snapshot while the live bot writes in WAL mode.
@@ -444,6 +522,20 @@ class DashboardService:
         result["memories"] = memories
         result["memory_page"] = memory_page_info
         result["memory_worker"] = self._memory_worker(connection, owner)
+        # marker 不可用时（build 不一致等）回落到进程记录的运行时信息，别让"算不出钱"再添一层困惑。
+        marker_model = (marker.get("model") if isinstance(marker, dict) else None) or self.runtime_info.get("model")
+        result["memory_usage"] = self._memory_usage_24h(connection, marker_model)
+        result["chat_usage"] = self._chat_usage_24h(connection, marker_model)
+        result["cost_today"] = {
+            "currency": "CNY",
+            "model": marker_model,
+            "chat_cny": result["chat_usage"]["cost_cny"],
+            "memory_cny": result["memory_usage"]["cost_cny"],
+            "total_cny": round(
+                result["chat_usage"]["cost_cny"] + result["memory_usage"]["cost_cny"], 3
+            ),
+            "note": "按 DeepSeek 官方单价折算（高峰/空闲自动判别）；模型未知时只显示 token",
+        }
         result["fragments"] = self._fragments(connection, owner)
         result["operations"] = self._operations(connection, marker)
         result["response_audit"] = self._response_audit(connection, owner)
@@ -530,6 +622,106 @@ class DashboardService:
         return records
 
     @staticmethod
+    def _memory_usage_24h(connection: sqlite3.Connection, model: object = None) -> dict[str, object]:
+        """近 24 小时记忆后台的 token 用量与折算金额（按阶段分开）。
+
+        2026-09-22：用户问「一天不到 20 块就没了」，而**记忆后台此前完全不记账**，
+        只能按窗口规模猜。这里把 worker 写进 job 账本的用量汇总出来，好回答
+        「钱花在抽取还是明细补跑」——并按官方单价（见 _LLM_PRICES）折算成人民币。
+        """
+
+        empty = {"window_hours": 24, "totals": {}, "jobs": 0, "cost_cny": 0.0}
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        try:
+            rows = connection.execute(
+                "SELECT occurred_at_utc, details_json FROM memory_job_events WHERE occurred_at_utc >= ?",
+                (since,),
+            ).fetchall()
+        except sqlite3.Error:
+            return empty
+        totals: dict[str, int] = {}
+        calls = 0
+        cost = 0.0
+        for row in rows:
+            try:
+                details = json.loads(row["details_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(details, dict):
+                continue
+            numbers: dict[str, int] = {}
+            for key, value in details.items():
+                if not isinstance(key, str) or not key.endswith(("_tokens", "_calls")):
+                    continue
+                if not isinstance(value, str) or not value.isdigit():
+                    continue
+                numbers[key] = int(value)
+                totals[key] = totals.get(key, 0) + numbers[key]
+            if not numbers:
+                continue
+            calls += 1
+            try:
+                when = datetime.fromisoformat(row["occurred_at_utc"])
+            except (TypeError, ValueError):
+                when = None
+            if when is not None:
+                for prefix in ("extraction", "detail"):
+                    hit = numbers.get(prefix + "_cache_hit_tokens", 0)
+                    cost += _price_cny(model, "hit", when, hit)
+                    cost += _price_cny(model, "output", when, numbers.get(prefix + "_output_tokens", 0))
+                    cost += _price_cny(
+                        model, "miss", when, max(0, numbers.get(prefix + "_input_tokens", 0) - hit)
+                    )
+        return {"window_hours": 24, "totals": totals, "jobs": calls, "cost_cny": round(cost, 3)}
+
+    @staticmethod
+    def _chat_usage_24h(connection: sqlite3.Connection, model: object = None) -> dict[str, object]:
+        """近 24 小时对话路径的 token 用量与折算金额（来自 generation trace）。
+
+        与记忆侧同一把尺子，好让「哪一侧更贵」一眼可见——2026-09-22 实测对话约 ¥1~3、
+        而卡死那天的重试风暴才是大头。
+        """
+
+        empty = {"window_hours": 24, "turns": 0, "input_tokens": 0, "cache_hit_tokens": 0,
+                 "output_tokens": 0, "cost_cny": 0.0}
+        since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        try:
+            rows = connection.execute(
+                "SELECT occurred_at_utc, details_json FROM turn_trace_events"
+                " WHERE phase='generation' AND occurred_at_utc >= ?",
+                (since,),
+            ).fetchall()
+        except sqlite3.Error:
+            return empty
+        totals = {"input_tokens": 0, "cache_hit_tokens": 0, "output_tokens": 0}
+        cost = 0.0
+        turns = 0
+        for row in rows:
+            try:
+                details = json.loads(row["details_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(details, dict):
+                continue
+            hits = details.get("cache_hit_tokens") or 0
+            inputs = details.get("input_tokens") or 0
+            outputs = details.get("output_tokens") or 0
+            if not all(isinstance(value, int) and value >= 0 for value in (hits, inputs, outputs)):
+                continue
+            totals["input_tokens"] += inputs
+            totals["cache_hit_tokens"] += hits
+            totals["output_tokens"] += outputs
+            turns += 1
+            try:
+                when = datetime.fromisoformat(row["occurred_at_utc"])
+            except (TypeError, ValueError):
+                continue
+            cost += _price_cny(model, "hit", when, hits)
+            cost += _price_cny(model, "miss", when, max(0, inputs - hits))
+            cost += _price_cny(model, "output", when, outputs)
+        return {**empty, **totals, "turns": turns, "cost_cny": round(cost, 3)}
+
+    @staticmethod
     def _memory_worker(connection: sqlite3.Connection, owner: object) -> dict[str, object] | None:
         if owner is None:
             return None
@@ -590,7 +782,13 @@ class DashboardService:
             "dropped_review_count", "empty_result", "parse_error_code",
             "candidate_error_codes", "review_error_codes", "provider_error",
             "outcome_kind", "outcome_reason_code",
+            # 2026-09-22 成本可见性：记忆后台的 token 用量（worker 在每次任务结束时写入）。
+            "extraction_input_tokens", "extraction_output_tokens",
+            "extraction_cache_hit_tokens", "extraction_reasoning_tokens", "extraction_calls",
+            "detail_input_tokens", "detail_output_tokens",
+            "detail_cache_hit_tokens", "detail_reasoning_tokens", "detail_calls",
         }
+        usage_keys = {key for key in allowed if key.endswith(("_tokens", "_calls"))}
         provider_errors = {
             "timeout", "connection", "rate_limit", "server_error", "protocol",
             "authentication", "model_not_found", "request", "unknown",
@@ -613,6 +811,8 @@ class DashboardService:
             if key not in allowed or not isinstance(item, str) or len(item) > 256:
                 continue
             if key.endswith("_count") and (not item.isascii() or not item.isdigit() or not 0 <= int(item) <= 12):
+                continue
+            if key in usage_keys and (not item.isascii() or not item.isdigit() or int(item) > 10**12):
                 continue
             if key == "empty_result" and item != "1":
                 continue
@@ -883,7 +1083,7 @@ class DashboardService:
 
         query = text.strip()
         now = self.clock()
-        local_zone = self.local_zone
+        local_zone = datetime.now().astimezone().tzinfo
         windows = query_fragments((query,))
         days = referenced_dates((query,), now=now, local_zone=local_zone)
 
@@ -1004,7 +1204,10 @@ class DashboardService:
             generation = metadata.get("generation_metadata")
             safe_generation: dict[str, object] = {}
             if isinstance(generation, dict):
-                for key in ("source", "context_version", "relationship_memory_ids", "retrieved_memory_ids", "candidate_memory_ids", "quoted_event_id", "history_event_count"):
+                # 2026-09-22 用户要求「把该显示出来的挂上」：working_set_memory_ids 原先不在
+                # 这份白名单里，于是**每轮都注入的工作集一条都显示不出来**——他看到的是常驻的
+                # 几条，而实际每轮还有几十条工作集在场。
+                for key in ("source", "context_version", "relationship_memory_ids", "working_set_memory_ids", "retrieved_memory_ids", "candidate_memory_ids", "quoted_event_id", "history_event_count"):
                     value = generation.get(key)
                     if key.endswith("_ids"):
                         if (
@@ -1080,7 +1283,9 @@ class DashboardService:
                     action_kind = payload.get("action_kind") if isinstance(payload, dict) else None
                 except (TypeError, ValueError, json.JSONDecodeError):
                     pass
-            for key in ("relationship_memory_ids", "retrieved_memory_ids"):
+            # 2026-09-22 用户要求「把该显示出来的挂上」：工作集（每轮固定注入的那几十条）
+            # 之前**没有投影**——他看到的比实际少得多（只看到常驻的 5 条，实际每轮还另有 66 条）。
+            for key in ("relationship_memory_ids", "working_set_memory_ids", "retrieved_memory_ids"):
                 ids = safe_generation.get(key, [])
                 ref_key = key.replace("_memory_ids", "_refs")
                 safe_generation[ref_key] = [scoped_memories[item] for item in ids if item in scoped_memories]

@@ -8,7 +8,6 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from zoneinfo import ZoneInfo
 from urllib.parse import unquote, urlsplit, parse_qs
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -190,11 +189,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=Path, default=ROOT / "data" / "qichi.sqlite3")
     parser.add_argument("--ready", type=Path, default=ROOT / "runtime" / "qichi-ready.json")
     parser.add_argument("--lock", type=Path, default=ROOT / "runtime" / "qichi.lock")
-    parser.add_argument(
-        "--timezone",
-        default=None,
-        help="IANA 时区，与 config.yaml 的 app.timezone 保持一致；不传则用本机时区",
-    )
     args = parser.parse_args(argv)
     service = DashboardService(
         args.db,
@@ -205,7 +199,6 @@ def main(argv: list[str] | None = None) -> int:
             "context_window": 262144,
         },
         lock_path=args.lock,
-        local_zone=ZoneInfo(args.timezone) if args.timezone else None,
     )
     server = create_server(service, port=args.port)
     try:

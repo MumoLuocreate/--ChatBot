@@ -125,6 +125,13 @@ class MemoryDetailPass:
         self.max_output_tokens = max_output_tokens
         self.timeout_seconds = timeout_seconds
         self.dropped = 0
+        # 成本可见性（2026-09-22）：明细补跑是记忆后台最贵的一环（按 32 条上限切分、
+        # 每次重发整个窗口），此前没有任何记账。
+        self.usage_input_tokens = 0
+        self.usage_output_tokens = 0
+        self.usage_cache_hit_tokens = 0
+        self.usage_reasoning_tokens = 0
+        self.usage_calls = 0
 
     async def generate(self, events: Sequence[ConversationEvent]) -> tuple[MemoryDetailDraft, ...]:
         """Return the timeline in verified event order, or nothing.
@@ -142,6 +149,11 @@ class MemoryDetailPass:
             # Thinking consumes the whole output budget before any JSON appears.
             thinking={"type": "disabled"},
         )
+        self.usage_input_tokens += int(getattr(generation, "input_tokens", 0) or 0)
+        self.usage_output_tokens += int(getattr(generation, "output_tokens", 0) or 0)
+        self.usage_cache_hit_tokens += int(getattr(generation, "cache_hit_tokens", 0) or 0)
+        self.usage_reasoning_tokens += int(getattr(generation, "reasoning_tokens", 0) or 0)
+        self.usage_calls += 1
         raw = generation.text
         if not raw.strip():
             raise MemoryDetailPassError("detail pass returned no visible output")

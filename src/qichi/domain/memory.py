@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from typing import Any, Literal, Mapping, TypeAlias
 
@@ -32,6 +32,17 @@ MemoryAssessmentReason: TypeAlias = Literal[
 ]
 MemoryRecallScope: TypeAlias = Literal["always", "topic", "confirmation", "none"]
 MemoryReviewAction: TypeAlias = Literal["support", "confirm", "reject", "expire"]
+
+# 可作为长期记忆证据的出站来源（2026-09-21 卡⑤：加入 initiative）。
+# 用户裁定「主动消息进记忆，但一般主动消息很少有有效信息，除非她找我本身也是一件
+# 值得记录的事情」——准入放开后，边界由取证角色矩阵保证（关于用户的记录必须以用户
+# 的话为证据；她自己的记录走 self_expression）。
+# 有意例外：extractor._structural_sensitive_episode 使用更窄的 {dialogue, interaction}
+# ——那里只需要「双边交换够长」的门槛，放进 initiative 会削弱场景结构守卫。
+# 这个谓词曾在三处各写一份；现在统一从这里取，避免再次漂移。
+MEMORY_RELIABLE_SOURCES: frozenset[str] = frozenset(
+    {"dialogue", "interaction", "initiative"}
+)
 MemoryPrivacyClass: TypeAlias = Literal["ordinary", "intimate", "adult"]
 MemoryRecallPolicy: TypeAlias = Literal[
     "daily_safe", "topic_only", "explicit_request_only"
@@ -300,6 +311,33 @@ class MemoryRecord:
     @classmethod
     def from_json(cls, value: str) -> "MemoryRecord":
         return cls.from_dict(json.loads(value))
+
+
+def working_set_resident(
+    record: Any,
+    at_utc: datetime,
+    *,
+    episode_max_age_days: int,
+) -> bool:
+    """这一条是否还该留在**常驻**工作集里（卡B④ 的年龄门）。
+
+    只有 episode 会因年龄退场。偏好、约定、纠正是常驻关系状态（AGENTS.md 冻结
+    不变式），再老也不退——2026-09-22 的审计里 107 条 active preference 全部常驻，
+    那是有意为之，不是冗余。
+
+    **退场不等于删除**：记录、证据、索引都还在库里，仍可被检索按相关度带回来；
+    这里只决定它是否每轮都在场。episode_max_age_days=0 表示不按年龄退场。
+
+    判据与实测见 doc/方案-20260922-写入侧作用范围与移出可逆.md 第 5 节。
+    """
+    if type(episode_max_age_days) is not int or episode_max_age_days < 0:
+        raise ValueError("episode_max_age_days must be a non-negative integer")
+    if episode_max_age_days == 0 or getattr(record, "type", None) != "episode":
+        return True
+    if not isinstance(at_utc, datetime):
+        raise TypeError("at_utc must be a datetime")
+    age = _aware_utc(at_utc, "at_utc") - record.valid_from_utc
+    return age <= timedelta(days=episode_max_age_days)
 
 
 @dataclass(frozen=True)

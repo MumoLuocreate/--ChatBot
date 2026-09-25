@@ -28,6 +28,35 @@ def stack(tmp_path):
     try: yield db,EventRepository(db),MemoryRepository(db)
     finally: db.close()
 def worker(db,mem,llm=None): return MemoryWorker(MemoryExtractor(llm or LLM()),mem,database=db,conversation_id='conversation-a')
+def test_take_usage_collects_the_memory_backend_counters_and_zeroes_them(stack):
+    """命中（2026-09-22）：记忆后台的 token 用量必须被取走（好写进 job 账本），且读后清零。
+
+    背景：用户问「一天不到 20 块就没了」，而记忆后台此前**完全不记账**，
+    只能靠窗口规模猜钱花在哪。
+    """
+
+    from types import SimpleNamespace
+
+    db, _evs, mem = stack
+    extractor_llm = SimpleNamespace(
+        usage_input_tokens=100, usage_output_tokens=20,
+        usage_cache_hit_tokens=5, usage_calls=1,
+    )
+    detail = SimpleNamespace(usage_input_tokens=200, usage_output_tokens=30, usage_calls=2)
+    worker_ = MemoryWorker(
+        MemoryExtractor(extractor_llm), mem, database=db,
+        conversation_id="conversation-a", detail_pass=detail,
+    )
+
+    usage = worker_._take_usage()
+
+    assert usage["extraction_input_tokens"] == "100"
+    assert usage["extraction_cache_hit_tokens"] == "5"
+    assert usage["detail_input_tokens"] == "200"
+    assert usage["detail_calls"] == "2"
+    assert worker_._take_usage() == {}, "取走必须清零，否则下一次会重复记账"
+
+
 def test_safe_failure_details_keep_the_reason_code_but_never_its_message():
     failure = ExtractionFailure(
         "repository_error",
@@ -504,6 +533,66 @@ async def test_partial_parse_diagnostics_are_recorded_on_completed_job(stack):
         "outcome_reason_code": "explicit_user_preference",
     }
 
+@pytest.mark.asyncio
+async def test_a_window_of_only_her_own_words_closes_out_and_advances_the_watermark(stack):
+    """第一半的真机判据②：这样的窗口收口后水位必须越过它，后面被堵的事件才能进记忆。
+
+    真机：水位停在 10441，其后 10445-10448 全被一行 failed 挡住。
+    """
+
+    db, evs, mem = stack
+    # 她的主动话要带 generation_metadata.source 才算「可信活动」（_is_reliable），
+    # 真机上这两条就是 source=initiative 的主动开口。
+    evs.insert(event(0, direction="outbound", actor="qichi", status="sent", source="initiative"))
+    evs.insert(event(1, at=NOW + timedelta(minutes=1), direction="outbound", actor="qichi", status="sent", source="initiative"))
+
+    class RestatedReviewLLM:
+        """她复述了一条已有约定，模型据此产出一条复述项；该证据指向用户，但窗口里没有他的话。"""
+
+        async def generate(self, es):
+            return json.dumps({
+                "outcome": {"kind": "memory_found", "reason_code": "existing_memory_review"},
+                "candidates": [],
+                "reviews": [{
+                    "memory_id": "existing-memory", "action": "confirm",
+                    "certainty": "confirmed", "importance": 2,
+                    "temporal_scope": "ongoing",
+                    "assessment_reason_code": "later_user_confirmation",
+                    "evidence": [{
+                        "event_id": "1", "actor": "mumo",
+                        "exact_quote": "1", "role": "source",
+                    }],
+                }],
+            }, ensure_ascii=False)
+
+    w = MemoryWorker(
+        MemoryExtractor(RestatedReviewLLM()), mem, database=db, conversation_id="conversation-a"
+    )
+    w.notify_reliable_activity("conversation-a")
+    w.open_semantic_gate()
+    # 静默窗口是相对**最后一条**事件算的，所以第二句在 +1 分钟时要跑在 +31 之后。
+    runs = await w.run_due(NOW + timedelta(minutes=31))
+
+    assert runs and not runs[0].failed, "她单独锚定的窗口不该在这里变成 failed"
+    actions = [row[0] for row in db.connection.execute(
+        "SELECT action FROM memory_job_events ORDER BY rowid"
+    )]
+    assert actions[-1] == "completed"
+    detail = json.loads(db.connection.execute(
+        "SELECT details_json FROM memory_job_events WHERE action='completed'"
+        " ORDER BY rowid DESC LIMIT 1"
+    ).fetchone()[0])
+    assert detail["empty_result"] == "1"
+    assert detail["outcome_kind"] == "no_persistent_memory"
+    assert db.connection.execute(
+        "SELECT value_json FROM runtime_meta WHERE key=?",
+        ("memory_worker:conversation-a:processed_sequence",),
+    ).fetchone()[0] == "1", "水位必须越过这个窗口"
+    assert db.connection.execute(
+        "SELECT count(*) FROM memory_session_jobs"
+    ).fetchone()[0] == 0, "收口后不许留下占位行"
+
+
 def _parse_failing_worker(db, mem):
     """一个内容层失败（parse_error）的 worker：模拟上游崩坏时返回残缺 JSON。"""
 
@@ -896,6 +985,104 @@ def test_recover_pending_reopens_old_transient_failure(stack):
     ).fetchone()
     assert tuple(row) == ("pending", 2, 0, None)
 
+def test_domain_validation_failures_are_content_level_not_transient():
+    """命中（2026-09-22）：代码自己的领域校验失败算**内容层**，不是网络抖动。
+
+    它原先被标成 `repository_error`（瞬时类），于是永不隔离、一直重试、启动还要等冷却——
+    真机上一条约文里的坏标点就这样把记忆水位钉了 8 小时。
+    """
+
+    category, details = MemoryWorker._consolidation_failure(
+        ValueError("detail exact quote is absent from source event")
+    )
+    assert category == "schema_error"
+    assert details == {"domain_error": "detail exact quote is absent from source event"}
+
+
+def test_database_level_failures_stay_transient():
+    """不误判：不是代码自有信息的错误（数据库/供应商消息）仍是瞬时类，不带诊断。"""
+
+    category, details = MemoryWorker._consolidation_failure(RuntimeError("database is locked"))
+    assert category == "repository_error", "驱动类异常不是内容层"
+    assert details == {}
+    # sqlite 的 OperationalError 是 ValueError 吗？不是（它是 sqlite3.Error），所以仍然瞬时。
+    import sqlite3
+
+    assert MemoryWorker._consolidation_failure(sqlite3.OperationalError("database is locked"))[0] == "repository_error"
+    # 形状像领域消息但不是已知措辞的，也保守地留在瞬时类。
+    assert MemoryWorker._consolidation_failure(ValueError("something odd happened"))[0] == "repository_error"
+
+
+def test_startup_reopens_a_content_failure_without_waiting_the_cooldown(stack):
+    """命中：内容层失败在启动时**不等冷却**就重开（重启是人工动作，正是补齐的时机）。"""
+
+    db, evs, mem = stack
+    evs.insert(event(0, NOW))
+    failing = worker(db, mem, LLM(True))
+    failing.notify_reliable_activity("conversation-a")
+    failing.open_semantic_gate()
+
+    import asyncio
+
+    async def finish():
+        for minute in (30, 31, 34, 45):
+            await failing.run_due(NOW + timedelta(minutes=minute))
+
+    asyncio.run(finish())
+    db.connection.execute(
+        "UPDATE memory_session_jobs SET failure_category='schema_error', updated_at_utc=?",
+        ((NOW + timedelta(minutes=45)).isoformat(),),
+    )
+    db.connection.commit()
+    later = MemoryWorker(
+        MemoryExtractor(LLM()),
+        mem,
+        database=db,
+        conversation_id="conversation-a",
+        clock=lambda: NOW + timedelta(minutes=47),  # 离冷却到期（+30 分钟）还差得远
+    )
+
+    later.recover_pending("conversation-a")
+
+    row = db.connection.execute("SELECT status FROM memory_session_jobs").fetchone()
+    assert row[0] == "pending", "内容层失败必须在启动时直接重开"
+
+
+def test_startup_keeps_a_transient_failure_inside_the_cooldown(stack):
+    """不误判：供应商/瞬时类失败照旧受 30 分钟冷却约束，重启不会变成重试风暴。"""
+
+    db, evs, mem = stack
+    evs.insert(event(0, NOW))
+    failing = worker(db, mem, LLM(True))
+    failing.notify_reliable_activity("conversation-a")
+    failing.open_semantic_gate()
+
+    import asyncio
+
+    async def finish():
+        for minute in (30, 31, 34, 45):
+            await failing.run_due(NOW + timedelta(minutes=minute))
+
+    asyncio.run(finish())
+    db.connection.execute(
+        "UPDATE memory_session_jobs SET updated_at_utc=?",
+        ((NOW + timedelta(minutes=45)).isoformat(),),
+    )
+    db.connection.commit()
+    later = MemoryWorker(
+        MemoryExtractor(LLM()),
+        mem,
+        database=db,
+        conversation_id="conversation-a",
+        clock=lambda: NOW + timedelta(minutes=47),
+    )
+
+    later.recover_pending("conversation-a")
+
+    row = db.connection.execute("SELECT status FROM memory_session_jobs").fetchone()
+    assert row[0] == "failed", "冷却没到就不许重开瞬时类失败"
+
+
 
 class FakeDetailLLM:
     def __init__(self, payload, fail=False):
@@ -1026,3 +1213,96 @@ async def test_a_broken_whole_window_call_is_retried_on_each_half(stack):
 
 from qichi.dialogue.llm_client import LLMGeneration  # noqa: E402
 from qichi.memory.detail_pass import MemoryDetailPass  # noqa: E402
+
+class UsageLLM(LLM):
+    """A backend that reports token usage exactly the way the real wrapper does."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.usage_input_tokens = 0
+        self.usage_output_tokens = 0
+        self.usage_cache_hit_tokens = 0
+        self.usage_reasoning_tokens = 0
+        self.usage_calls = 0
+
+    async def generate(self, events):
+        # 先计数再调用：失败的调用同样花了钱，也必须记账。
+        self.usage_input_tokens += 1000
+        self.usage_output_tokens += 100
+        self.usage_cache_hit_tokens += 50
+        self.usage_reasoning_tokens += 10
+        self.usage_calls += 1
+        return await super().generate(events)
+
+
+def _usage_job_details(db, action=None):
+    sql = "SELECT details_json FROM memory_job_events"
+    args = ()
+    if action is not None:
+        sql += " WHERE action=?"
+        args = (action,)
+    row = db.connection.execute(sql + " ORDER BY rowid DESC LIMIT 1", args).fetchone()
+    return json.loads(row[0]) if row else {}
+
+
+@pytest.mark.asyncio
+async def test_the_completed_ledger_records_the_memory_backend_usage(stack):
+    """命中（2026-09-24 真机）：记账必须真的落进 job 账本，不只是 "_take_usage 取得出来"。
+
+    2026-09-22 加的记忆后台记账，只被 test_take_usage_... 覆盖到「取得出来」那一步，
+    没人检验它有没有穿过写库路径。成功路径要过 _safe_parse_details 的键白名单，
+    usage_* 被静默丢掉——真机 298 条 job 事件里 0 条带 usage_* 键。
+    """
+
+    db, evs, mem = stack
+    evs.insert(event(0))
+    client = FakeDetailLLM(detail_payload("0", "0"))
+    w = MemoryWorker(MemoryExtractor(UsageLLM()), mem, database=db,
+                     conversation_id="conversation-a", detail_pass=MemoryDetailPass(client))
+    w.notify_reliable_activity("conversation-a")
+    w.open_semantic_gate()
+    await w.run_due(NOW + timedelta(minutes=30))
+
+    details = _usage_job_details(db, "completed")
+    assert details.get("extraction_input_tokens") == "1000"
+    assert details.get("extraction_cache_hit_tokens") == "50"
+    assert details.get("extraction_calls") == "1"
+    assert details.get("detail_input_tokens") == "10", "明细补跑的用量同样要记账"
+
+
+@pytest.mark.asyncio
+async def test_the_retry_ledger_records_the_usage_spent_on_the_failure(stack):
+    """失败路径（worker.py:836）同样要记——白花的钱正是失败那次调用。"""
+
+    db, evs, mem = stack
+    evs.insert(event(0))
+    w = MemoryWorker(MemoryExtractor(UsageLLM(fail=True)), mem, database=db,
+                     conversation_id="conversation-a")
+    w.notify_reliable_activity("conversation-a")
+    w.open_semantic_gate()
+    await w.run_due(NOW + timedelta(minutes=30))
+
+    details = _usage_job_details(db, "retry_scheduled") or _usage_job_details(db, "failed")
+    assert details.get("reason_code"), "失败原因码仍要保留"
+    assert details.get("extraction_input_tokens") == "1000"
+
+
+def test_a_usage_shaped_key_riding_on_the_diagnostics_is_not_trusted():
+    """不误判：白名单的边界要保住——diag 里伪造的 usage_* 不许进账本。"""
+
+    merged = MemoryWorker._merge_diagnostics(
+        {"usage_extraction_input_tokens": "999999"},
+        candidate_count=0, review_count=0, dropped_review_count=0,
+        outcome_kind=None, outcome_reason_code=None)
+
+    assert "usage_extraction_input_tokens" not in merged
+
+
+def test_safe_usage_keeps_only_known_keys_with_plain_digit_values():
+    kept = MemoryWorker._safe_usage({
+        "extraction_input_tokens": "12", "detail_calls": "3",
+        "nonsense_key": "1", "extraction_output_tokens": "x",
+    })
+
+    assert kept == {"extraction_input_tokens": "12", "detail_calls": "3"}
+

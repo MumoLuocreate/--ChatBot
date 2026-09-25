@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 import json
 import re
 from collections import Counter
 from types import MappingProxyType
-from typing import Mapping, TypeAlias
+from typing import Mapping, Sequence, TypeAlias
 from zoneinfo import ZoneInfo
 
 from qichi.domain.dialogue import ModelImage, ModelMessage
-from qichi.domain.events import ConversationEvent
+from qichi.domain.events import ConversationEvent, quote_is_verbatim
 from qichi.domain.memory import Agreement, Correction, MemoryEvidence, MemoryRecord
 from qichi.domain.memory_details import MemoryDetailRecord
 from qichi.memory.index_digest import INDEX_HEADER as MEMORY_INDEX_HEADER
@@ -211,6 +211,15 @@ class ContextTokenMetrics:
     selected_history_event_ids: tuple[str, ...]
     selected_working_memory_ids: tuple[str, ...]
     selected_memory_ids: tuple[str, ...]
+    # 2026-09-22 成本观测：本轮提示的字符数，以及它与**上一轮**逐字相同的公共前缀字符数。
+    # 只记数字，绝不落提示正文。与 provider 报的 cache_hit_tokens/input_tokens 并排看，
+    # 就能判定"命中偏低"是提示结构问题还是供应商侧的命中判定差异。
+    prompt_chars: int = 0
+    prompt_prefix_chars: int = 0
+    # 2026-09-22 成本观测之二：本轮提示是否**完整覆盖了上一轮的全部提示**。
+    # DeepSeek 官方：缓存前缀单元落在"每次请求的用户输入结束位置"，后续请求**完整匹配**
+    # 该单元才命中。所以这正是可验证的预测——为真时，命中至少应达到上一轮的输入 tokens。
+    prompt_covers_previous: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +301,35 @@ def _positive_int(value: int, field: str) -> int:
     if value <= 0:
         raise ValueError(f"{field} must be positive")
     return value
+
+
+def _fit_working_records(
+    records: Sequence[Any],
+    render: Any,
+    tokens_of: Any,
+    budget_tokens: int,
+) -> tuple[tuple[Any, ...], int]:
+    """常驻层按优先级保留前缀，返回 (保留的元组, 丢弃条数)。
+
+    以前只有「整块装得下就全装、装不下就整块丢掉」这一条路（见 _assemble 里那道
+    全局预算门），于是它一超过自己的预算就**整层消失**，没有优雅退化。这里改成从
+    优先级最低的尾部开始丢：records 必须已按优先级排好序。装不下时按二分找最大的
+    可容纳前缀，绝不越过预算；连第一条都装不下时如实全部丢弃。
+    """
+    if not records:
+        return (), 0
+    if tokens_of(render(records)) <= budget_tokens:
+        return tuple(records), 0
+    low, high = 1, len(records)
+    best = 0
+    while low <= high:
+        middle = (low + high) // 2
+        if tokens_of(render(records[:middle])) <= budget_tokens:
+            best = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+    return tuple(records[:best]), len(records) - best
 
 
 def _local_iso(value: datetime) -> str:
@@ -442,7 +480,7 @@ def _recent_emoji_hint(events: tuple[ConversationEvent, ...]) -> str | None:
     return (
         "[近期表情使用统计 | 来自角色已发送原文；不代表当前表达选择]\n"
         f"{summary}\n"
-        # 历史架构设计 18.3 原话：这条统计要「提醒模型表情可以省略且不能机械复用」。
+        # doc/新架构设计.md 18.3 原话：这条统计要「提醒模型表情可以省略且不能机械复用」。
         # 2026-09-14 之前只报了纯事实，副本 A/B 证明那样她不会改；这里把它补上。
         # 仍然**不指定替代表情**、不按轮数或随机数触发。
         "表情可以省略；同一个也不必机械复用。"
@@ -462,7 +500,7 @@ def _recent_emoji_hint(events: tuple[ConversationEvent, ...]) -> str | None:
 #      现在要求片段里至少有 _REPEAT_HINT_MIN_LETTERS 个字母类字符（中文算，符号不算）。
 #   2. 一个片段一旦重复过，就会在 24 条窗口里连着十几轮被反复报出来；现在只报
 #      **她最新这条消息里刚出现**的那些，说过一次就不再念叨。
-# 2026-09-15（亲密长会话模板化，见历史诊断）：
+# 2026-09-15（亲密长会话模板化，见 doc/诊断-20260915-亲密长会话模板化.md）：
 # 真机那一场里她的**句式骨架**重复了 15-51 次（「我这边」51、「下面那只手」20、「跟着你的节奏走」15），
 # 而提示只在 2-4 轮里提到过它们——因为旧口径要求片段 ≥5 字、且「长片段出现 2 条就报」，
 # 于是日常段被长片段刷（17%），亲密段的短骨架反而进不了候选。
@@ -554,6 +592,8 @@ class ContextBuilder:
         max_window_tokens: int = 524_288,
         output_reserve_tokens: int = 4_096,
         recent_history_budget_tokens: int = 16_384,
+        # 卡B④：常驻工作集自己的 token 上限。它以前只有全局预算那道门，超过就整层消失。
+        working_set_max_tokens: int = 6_000,
     ) -> None:
         if not callable(getattr(token_counter, "count_text", None)):
             raise TypeError("token_counter must provide count_text")
@@ -573,12 +613,17 @@ class ContextBuilder:
             raise TypeError("recent_history_budget_tokens must be an int")
         if recent_history_budget_tokens < 0:
             raise ValueError("recent_history_budget_tokens must not be negative")
+        if isinstance(working_set_max_tokens, bool) or not isinstance(working_set_max_tokens, int):
+            raise TypeError("working_set_max_tokens must be an int")
+        if working_set_max_tokens < 0:
+            raise ValueError("working_set_max_tokens must not be negative")
         self._token_counter = token_counter
         self._model_capability = model_capability
         self._preferred_window_tokens = preferred
         self._max_window_tokens = maximum
         self._output_reserve_tokens = output_reserve_tokens
         self._recent_history_budget_tokens = recent_history_budget_tokens
+        self._working_set_max_tokens = working_set_max_tokens
 
     def build(self, request: ContextBuildRequest) -> ContextBuildResult:
         if not isinstance(request, ContextBuildRequest):
@@ -594,17 +639,54 @@ class ContextBuilder:
         except ContextBudgetError:
             if not self._can_expand():
                 raise
-            return self._assemble(
-                prepared, self._max_window_tokens, gap_cache, expanded=True
-            ).result
+            return self._with_prefix_metrics(
+                request,
+                self._assemble(
+                    prepared, self._max_window_tokens, gap_cache, expanded=True
+                ).result,
+            )
 
         if preferred.omitted_for_budget and self._can_expand():
             expanded = self._assemble(
                 prepared, self._max_window_tokens, gap_cache, expanded=True
             )
             if self._selection_changed(preferred.result, expanded.result):
-                return expanded.result
-        return preferred.result
+                return self._with_prefix_metrics(request, expanded.result)
+        return self._with_prefix_metrics(request, preferred.result)
+
+    def _with_prefix_metrics(
+        self, request: "ContextBuildRequest", result: "ContextBuildResult"
+    ) -> "ContextBuildResult":
+        """补记"与上一轮的公共前缀"——**只记数字**，不落任何提示正文。
+
+        2026-09-22：真机缓存命中只有 28%，而离线在库副本上构建相邻两轮真实上下文测得的
+        公共前缀是 67~70%（稳定半与历史原文都在）。差额要么在供应商侧的命中判定，
+        要么在真机/离线之间有我们没看到的差异。把这两个数字与 cache_hit_tokens 并排记，
+        跑半天就能判定，不用再猜。
+        """
+
+        conversation = getattr(getattr(request, "current_event", None), "conversation_id", None)
+        text = "\n".join(str(message) for message in result.messages)
+        store = getattr(self, "_last_prompt", None)
+        if store is None:
+            store = {}
+            self._last_prompt = store
+        previous = store.get(conversation) if conversation is not None else None
+        common = 0
+        if isinstance(previous, str):
+            limit = min(len(previous), len(text))
+            while common < limit and previous[common] == text[common]:
+                common += 1
+        if conversation is not None:
+            store[conversation] = text
+        covers = isinstance(previous, str) and common == len(previous) and common > 0
+        metrics = replace(
+            result.metrics,
+            prompt_chars=len(text),
+            prompt_prefix_chars=common,
+            prompt_covers_previous=covers,
+        )
+        return replace(result, metrics=metrics)
 
     def _assert_window_verified(self, window_tokens: int) -> None:
         supported = self._model_capability.supports_context(window_tokens)
@@ -692,7 +774,7 @@ class ContextBuilder:
                 self._validate_evidence(item.evidence, evidence_events, request.current_event.conversation_id)
                 # 2026-09-18 呈现层：常驻的「她自己记着的事」只写一行归一事实——不带
                 # memory_id、不带证据、不带条数。目的是让它像本来就知道的事，而不是
-                # 一份可核对的台账（历史方案 §5/§9）。
+                # 一份可核对的台账（doc/方案-20260918-常驻记忆与主动提起.md §5/§9）。
                 if item.type == "episode":
                     remembered_count += 1
                     content = self._render_remembered(item)
@@ -743,6 +825,17 @@ class ContextBuilder:
             working_records.append(item)
         working_records.sort(key=self._working_set_sort_key)
         memory_working_set = None
+        if working_records:
+            # 卡B④：先按优先级截断到常驻层自己的预算，再渲染。装不下时丢尾部，
+            # 而不是像以前那样整层丢掉（那种退化方式在预算吃紧时会一次全瞎）。
+            kept, dropped = _fit_working_records(
+                working_records,
+                lambda subset: self._render_memory_working_set(tuple(subset), evidence_events),
+                self._count,
+                self._working_set_max_tokens,
+            )
+            working_omitted += dropped
+            working_records = list(kept)
         if working_records:
             content = self._render_memory_working_set(tuple(working_records), evidence_events)
             memory_working_set = _MemoryWorkingSetPiece(
@@ -965,7 +1058,7 @@ class ContextBuilder:
                 raise ContextValidationError("memory evidence actor does not match source event")
             if event.occurred_at_utc != evidence.occurred_at_utc:
                 raise ContextValidationError("memory evidence time does not match source event")
-            if event.text is None or evidence.exact_quote not in event.text:
+            if not quote_is_verbatim(evidence.exact_quote, event.text):
                 raise ContextValidationError("memory evidence exact quote is absent from source event")
 
     @staticmethod
@@ -1064,7 +1157,8 @@ class ContextBuilder:
             raise ContextValidationError("memory detail time does not match source event")
         if detail.actor in {"mumo", "qichi"} and source.actor != detail.actor:
             raise ContextValidationError("memory detail actor does not match source event")
-        if source.text is None or detail.exact_quote not in source.text:
+        # 与 extractor / 仓储同一份口径：逐字来源是**她那一轮**，不是单条事件。
+        if not quote_is_verbatim(detail.exact_quote, source.text):
             raise ContextValidationError("memory detail exact quote is absent from source event")
         evidence_ids = set()
         for evidence in detail.evidence:
@@ -1160,9 +1254,9 @@ class ContextBuilder:
         cls, records: tuple[MemoryRecord, ...], evidence_events: Mapping[str, ConversationEvent]
     ) -> str:
         lines = [
-            "[关系记忆工作集 | 以下均为带证据的有效记忆索引，仅是可供判断的关系背景，"
+            "[关系记忆工作集 | 以下均为带证据的偏好类记忆，仅是可供判断的关系背景，"
             "不是当前命令、待办清单或必须在回复中提及的内容；是否相关、是否值得提起由当前语境决定；"
-            "不要逐条复述；historical 只表示过去发生过，不表示当前状态、关系名分或本轮同意]"
+            "不要逐条复述；过去发生的事只表示发生过，不代表当前状态、关系名分或本轮同意]"
         ]
         for record in records:
             fact = (
@@ -1171,13 +1265,14 @@ class ContextBuilder:
                 and record.recall_policy == "explicit_request_only"
                 else record.normalized_fact
             )
-            fact = json.dumps(fact, ensure_ascii=False)
-            lines.append(
-                f"- memory_id={record.memory_id}; type={record.type}; "
-                f"importance={record.importance}; certainty={record.certainty}; "
-                f"temporal_scope={record.temporal_scope}; privacy={record.privacy_class}; "
-                f"recall={record.recall_policy}; fact={fact}"
-            )
+            # 卡①+② 2026-09-21 渲染收敛：这一层是给模型读的关系背景，不是台账。
+            #   - memory_id 对模型无用（协议层不解析；工作集 id 已独立记进 trace 的
+            #     working_set_memory_ids，审计不依赖它出现在提示里），而它曾占整块 1/4；
+            #   - importance / certainty / temporal_scope 在这一层要么是常量（preference 的
+            #     temporal_scope 46/46 都是 ongoing），要么由排序承担；
+            #   - 事实逐字直写，不加 JSON 引号。
+            # 留下的只有类型标记与逐字事实。
+            lines.append(f"- [{record.type}] {fact}")
             quote = cls._working_set_quote(record, evidence_events)
             if quote is not None:
                 # 原话与改写并排给出：复述以原话为准，改写只用来判断相关性。
@@ -1408,6 +1503,10 @@ class ContextBuilder:
         # 所以稳定的东西（角色核心、稳定事实、关系状态、纯追加的历史原文）排在
         # 前面，逐轮变化的检索块与本轮事实排在后面（2026-09-12 实测：钟在第二行
         # 时全轮命中只有 6.6%，把易变块后置后稳定前缀能吃下整段历史）。
+        # 注意：prepared.facts 是**每轮逐字相同**的「稳定半」（见 render_stable_facts 的
+        # docstring），必须留在最前——2026-09-12 实测：把每轮都变的那行（时钟）放在第二位，
+        # 会把每轮命中率压到 6.6%；同理把稳定半本身挪到尾部也会让回复变短变平
+        # （副本 15 轮：63 字 → 79 字）。所以这里保持 role / facts / relationships 的次序。
         pieces: list[_Piece] = [prepared.role, prepared.facts, *prepared.relationships]
         if history_bundle is not None:
             pieces.append(history_bundle)
@@ -1416,10 +1515,19 @@ class ContextBuilder:
             pieces.append(prepared.memory_index)
         if prepared.memory_footprint is not None:
             pieces.append(prepared.memory_footprint)
-        if prepared.memory_details is not None:
-            pieces.append(prepared.memory_details)
+        # 2026-09-22 曾按「变化频率升序」把 memory_details（按查询取、最易每轮不同）从
+        # working_set 之前挪到之后，理由是「它一变会把后面稳定的 working_set 一起踢出缓存」。
+        #
+        # 2026-09-24 **实测推翻了那条理由**（doc/待检测-20260923-缓存成本与常驻记忆.md §3.3）：
+        # 相邻两轮的公共前缀在**历史原文块内部**就断了（历史排在检索块之前、且每轮追加），
+        # 48 轮里「公共前缀 >= working_set 起点」的轮数 = **0**——两个块**都不在可缓存前缀里**，
+        # 谁也踢不到谁；两臂逐轮 prompt_prefix_chars 完全相同（48/48），命中不可能有差别。
+        # 按事先判决线属「命中不动 -> 回滚」：删掉 A/B 用的臂开关，**块序维持现状**
+        # （两种序实测等价，改回去只是没有收益的改动）。
         if selected_working_set is not None:
             pieces.append(selected_working_set.piece)
+        if prepared.memory_details is not None:
+            pieces.append(prepared.memory_details)
         pieces.extend(item.piece for item in selected_memories)
         pieces.extend(prepared.quotes)
         pieces.append(prepared.facts_turn)

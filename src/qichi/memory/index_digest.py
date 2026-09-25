@@ -1,6 +1,6 @@
 """Build the always-on neutral index of recent memory fragments.
 
-The frozen contract (历史记忆契约 section 5.2) requires a
+The frozen contract (doc/Memory-Detailed-Record-Plan.md section 5.2) requires a
 short, code-generated index so the character knows *that* something happened
 recently without any content being disclosed.  Detail and verbatim text stay
 behind the recall matrix and are only expanded on a native quote or the frozen

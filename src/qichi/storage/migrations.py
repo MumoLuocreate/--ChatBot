@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _KNOWN_MEMORY_V2_LEGACY_FINGERPRINT = (
     "5e91ace57ccfd29f6757afecc35502c88e89a7cb77d85bff70fbdb6b19da259c"

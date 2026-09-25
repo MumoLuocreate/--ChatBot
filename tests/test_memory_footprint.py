@@ -238,6 +238,8 @@ def test_working_set_keeps_the_placeholder_for_adult_records_without_quoting_the
 
     assert "[关系记忆工作集" in text
     assert "成人相关的原话" not in text
+    # 卡②不误判：成人 explicit_request_only 仍必须被替换成占位句，不得照抄原话。
+    assert "已有成人相关历史证据" in text
 
 
 def test_daily_chat_context_is_unchanged_without_memories():

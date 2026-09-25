@@ -61,7 +61,7 @@ class RuntimeAssemblyError(ValueError):
 
 
 # 语音语气指令：一次极短的调用，交给后台档（flash）。见
-# 历史TTS计划 §2.21 / §3.1b —— 用户裁定"决定语气的模型不能是 pro"。
+# doc/TTS-实施计划-20260914.md §2.21 / §3.1b —— 用户裁定"决定语气的模型不能是 pro"。
 VOICE_INSTRUCTION_MAX_OUTPUT_TOKENS = 200
 VOICE_INSTRUCTION_TIMEOUT_SECONDS = 20
 
@@ -277,6 +277,7 @@ def build_runtime(
         max_window_tokens=config.dialogue.context_window_max_tokens,
         output_reserve_tokens=config.dialogue.output_reserve_tokens,
         recent_history_budget_tokens=config.dialogue.recent_history_budget_tokens,
+        working_set_max_tokens=config.memory.working_set_max_tokens,
     )
     if llm_client is None:
         llm_client = _build_llm_client(
@@ -321,10 +322,8 @@ def build_runtime(
         # one data root instead of two.
         media_root=_resolve_project_path(project_root, config.storage.database_path).parent,
         auto_quote_current_message=config.dialogue.auto_quote_current_message,
-        # 日期分桶按配置声明的时区走，不跟随运行机器：否则把部署搬到 UTC 机器上，
-        # 「今天/昨天」会在午夜前后整体错位（2026-09-19 CI 在 UTC runner 上复现）。
-        local_zone=ZoneInfo(config.app.timezone),
         always_include_memory_types=config.memory.always_include_types,
+        working_set_episode_max_age_days=config.memory.working_set_episode_max_age_days,
         memory_candidate_limit=config.memory.retrieval_candidate_top_k,
         memory_context_limit=config.memory.episodic_top_k,
         tool_runner=tool_runner,
@@ -387,6 +386,14 @@ class _MemoryExtractionLLM:
         # (a truncated response and a malformed one look identical otherwise).
         self.last_finish_reason: str | None = None
         self.last_output_tokens: int | None = None
+        # 成本可见性（2026-09-22）：记忆后台此前**完全不记账**，用户问"为什么这么贵"
+        # 时只能按窗口规模猜。这里与 MemoryDetailPass 各自累计，worker 每次任务结束时
+        # 取走（读后清零）并写进 job 账本。
+        self.usage_input_tokens = 0
+        self.usage_output_tokens = 0
+        self.usage_cache_hit_tokens = 0
+        self.usage_reasoning_tokens = 0
+        self.usage_calls = 0
 
     async def generate(
         self,
@@ -596,6 +603,11 @@ class _MemoryExtractionLLM:
         self.last_finish_reason = finish_reason if isinstance(finish_reason, str) else None
         output_tokens = getattr(result, "output_tokens", None)
         self.last_output_tokens = output_tokens if type(output_tokens) is int else None
+        self.usage_input_tokens += int(getattr(result, "input_tokens", 0) or 0)
+        self.usage_output_tokens += int(getattr(result, "output_tokens", 0) or 0)
+        self.usage_cache_hit_tokens += int(getattr(result, "cache_hit_tokens", 0) or 0)
+        self.usage_reasoning_tokens += int(getattr(result, "reasoning_tokens", 0) or 0)
+        self.usage_calls += 1
         return result.text
 
     @staticmethod

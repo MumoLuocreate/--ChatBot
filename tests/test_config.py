@@ -87,7 +87,11 @@ def test_load_example_config_from_environment(config_path: Path, complete_enviro
     assert config.transport.local_chat_history.retention_days is None
     assert config.persona.prompt_mode == "thin"
     assert config.persona.system_prompt_file == Path("doc/运行时角色核心.example.md")
-    assert config.persona.reference_files == ()
+    assert config.persona.reference_files == (
+        Path("doc/人设-角色.md"),
+        Path("doc/用户画像.md"),
+        Path("doc/角色外貌设定.md"),
+    )
     assert config.persona.inject_reference_files_verbatim is False
     assert config.expression.unicode_emoji.enabled is True
     assert config.expression.unicode_emoji.selection == "model_native"
@@ -152,8 +156,11 @@ def test_load_example_config_from_environment(config_path: Path, complete_enviro
         "privacy_and_owner_scope",
     )
     assert config.initiative.enabled is True
+    # 2026-09-19 体验优化：实测 allow_model_to_skip 空转（115 次尝试 0 次跳过），
+    # 「两条就不发了」完全是这个上限造成的。间隔与日上限是 InitiativePolicy 冻结的
+    # （60 分钟、必须保持未设置），只有上限这一项可以放。
     assert config.initiative.idle_attempt_minutes == 60
-    assert config.initiative.max_unanswered_attempts == 2
+    assert config.initiative.max_unanswered_attempts == 5
     assert config.initiative.reset_on_user_message is True
     assert config.initiative.use_same_dialogue_engine is True
     assert config.initiative.allow_model_to_skip is True
@@ -492,7 +499,7 @@ def test_merge_window_order_is_rejected(
     with pytest.raises(ConfigError, match="merge_window_ms"):
         load_config(path, environ=complete_environment)
 
-# --- 语音配置（TTS P1-5，见历史TTS计划 §3.6）---
+# --- 语音配置（TTS P1-5，见 doc/TTS-实施计划-20260914.md §3.6）---
 
 SHIPPED_CONFIG = Path(__file__).parents[1] / "config.example.yaml"
 
@@ -587,7 +594,7 @@ def test_voice_refuses_an_inline_api_key(tmp_path, complete_environment):
 
 def test_voice_enabled_without_a_frozen_voice_is_refused(tmp_path, complete_environment):
     path = enable_voice(tmp_path, {
-        "  voice_id: REPLACE_WITH_YOUR_OWN_VOICE_ID": "  voice_id: \"\"",
+        "  voice_id: qwen-tts-vd-qichi_cast2-voice-20260914182133631-9160": "  voice_id: \"\"",
     })
     env = {**complete_environment, "DASHSCOPE_API_KEY": "secret"}
 

@@ -11,10 +11,7 @@ runtime/*
 !runtime/t25/
 runtime/t25/*
 !runtime/t25/siliconflow-v4f-capability.json
-# 运行时数据目录。唯一例外是随仓库分发的表情目录示例——
-# 它被 config.example.yaml 与测试引用，不带上的话 clone 下来跑不起来。
-data/*
-!data/qq-expression-catalog.example.json
+data/
 bot.log
 chat_his/
 _backups/
@@ -26,6 +23,4 @@ backups/
 .test-tmp-*/
 .pytest-tmp-*/
 _tmp/
-
-# 私有角色核心：把示例复制成这个文件名时不要提交
 doc/运行时角色核心.md

@@ -85,7 +85,7 @@ def detail_payload(events: tuple[ConversationEvent, ...]) -> str:
                     "recall_policy": "explicit_request_only",
                     # 与抽取提示词声明的唯一一种 evidence 形状一致：模型就是这么写的。
                     # 旧解析器只认 {event_id, role}，于是这条 payload 会让每个窗口都失败
-                    # （真机 seq 7306-7320 被隔离，见历史诊断）。
+                    # （真机 seq 7306-7320 被隔离，见 doc/诊断-20260916-记忆抽取证据契约冲突.md）。
                     "evidence": [
                         {
                             "event_id": item.event_id,

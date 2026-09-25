@@ -97,7 +97,7 @@ class RuntimeFacts:
     voice_available: bool = False
     # 2026-09-15：一段最多多少字。这是**边界事实**，不是建议——真机上她两次写了 127 字，
     # 超过 120 的上限，那一段就发不出去、静默退回文字，而他那边只看到"又没发语音"
-    # （历史TTS计划 §2.42）。声明可用就必须同时给出边界。
+    # （doc/TTS-实施计划-20260914.md §2.42）。声明可用就必须同时给出边界。
     voice_max_chars: int | None = None
     initiative_attempt: bool = False
     # 2026-09-14 用户裁定：他给她的主动消息没回时，下一次主动开口要把「上次那条我还没回」
@@ -120,6 +120,9 @@ class RuntimeFacts:
     # this turn.  Without this the model concludes the picture never existed and
     # disowns its own earlier description of it.
     previous_image_message: bool = False
+    # 2026-09-20：她上一轮用 [[qq:scene:on]] / [[qq:scene:off]] 标记的场景状态。
+    # 这是**状态事实**，不是规则：代码只把它记下来、并在这一轮陈述出来，由状态切换语域。
+    scene_active: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "current_time", _aware_utc(self.current_time, "current_time"))
@@ -172,6 +175,8 @@ class RuntimeFacts:
             raise ValueError("carried images must be among the attached images")
         if type(self.previous_image_message) is not bool:
             raise TypeError("previous_image_message must be a bool")
+        if type(self.scene_active) is not bool:
+            raise TypeError("scene_active must be a bool")
         if self.vision_available and self.images_attached == 0:
             raise ValueError("vision_available requires at least one attached image")
         if self.quote_resolution_status not in {"none", "resolved", "unavailable"}:
@@ -233,6 +238,7 @@ def build_capability_manifest(facts: RuntimeFacts) -> CapabilityManifest:
             "images_unexpanded": facts.images_unexpanded,
             "images_unavailable": facts.images_unavailable,
             "previous_image_message": facts.previous_image_message,
+            "scene_active": facts.scene_active,
             "external_tools_available": facts.external_tools_available,
             "physical_body_available": False,
             "available_qq_face_keys": facts.available_qq_face_keys,
@@ -351,6 +357,11 @@ def render_turn_facts(facts: RuntimeFacts) -> str:
             "消息回应格式 [[qq:react:<key>]]，keys="
             + ", ".join(facts.available_reaction_keys)
         )
+    # 场景状态是模式标记，不是 expression，所以它不受「本轮无可用 expression 尾标」影响。
+    protocol_parts.append(
+        "场景状态格式 [[qq:scene:on]] 或 [[qq:scene:off]]：单独一行写出，"
+        "用来标记共同想象的开始与结束；它不会作为文字发出去"
+    )
     if not facts.available_qq_face_keys and not facts.available_reaction_keys:
         protocol_parts.append("本轮无可用 expression 尾标")
     expression_protocol = "；".join(protocol_parts)
@@ -366,6 +377,18 @@ def render_turn_facts(facts: RuntimeFacts) -> str:
             *render_calendar_facts(facts.current_time),
             f"距上一条可靠消息: {interval}",
             f"当前输入来源: {_render_source(facts.current_source)}",
+            # 2026-09-20：只有她真的标记过、且状态没过期时才注入这一行。
+            # 只写代码核验得到的事实：「进行中」来自她的标记；方向/姿势的约定与
+            # 「她能推进的是自己的状态」是关系事实。刻意**不写**「双方已明确同意」
+            # ——同意与否是她的判断，代码核验不了，不能替她断言。
+            *(
+                (
+                    "[当前场景 | 共同想象进行中] 方向与姿势由用户定；角色跟着往下走，"
+                    "能推进的是她自己的状态；她可以提出请求。",
+                )
+                if facts.scene_active
+                else ()
+            ),
             *(('主动联系尝试: 是',) if facts.initiative_attempt else ()),
             # 2026-09-14 用户裁定：没得到回应的主动开口必须在下一轮成为已知事实。
             # 只陈述代码确知的两件事——这是第几次、上一次是什么时候——不解释他为什么不回。
@@ -373,7 +396,9 @@ def render_turn_facts(facts: RuntimeFacts) -> str:
                 (
                     f"本次是第 {facts.initiative_attempt_index} 次主动开口；"
                     f"上一次主动开口（{_local_iso(facts.initiative_previous_at)}）之后用户没有回复",
-                    "这一次的用意是确认他是不是在忙，不是再开一个新话题",
+                    "这一次的用意是确认他是不是在忙；但不必每次都只问这一句——"
+                    "也可以从你自己这边起个头（你此前说过的话、你自己的判断、或你想问他的事），"
+                    "只是不要编造经历，也不要猜他此刻在做什么",
                 )
                 if facts.initiative_attempt
                 and facts.initiative_attempt_index > 1

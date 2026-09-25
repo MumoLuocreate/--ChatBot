@@ -317,7 +317,7 @@ def test_expression_action_and_key_sets_can_be_enabled_together():
     )
     assert value.available_qq_face_keys == ("shy",)
 
-# --- 语音能力声明（TTS P1-3，见历史TTS计划 §3.4）---
+# --- 语音能力声明（TTS P1-3，见 doc/TTS-实施计划-20260914.md §3.4）---
 
 
 def test_voice_is_declared_only_when_the_channel_is_actually_ready():

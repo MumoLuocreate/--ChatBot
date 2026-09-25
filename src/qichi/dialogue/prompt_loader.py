@@ -1,18 +1,10 @@
-"""Load the single runtime role prompt without pulling in reference documents.
-
-The engine owns no persona. The only role text ever injected is the one file a
-deployment points at through `persona.system_prompt_file`; this module loads
-exactly that file and nothing else, so reference documents can never leak into
-the hot path by accident.
-"""
+"""Load the single runtime role prompt without pulling in reference documents."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 
-# Default used when a caller has no configuration at hand. Production paths come
-# from `persona.system_prompt_file`, not from this constant.
 RUNTIME_PROMPT_PATH = Path("doc") / "运行时角色核心.md"
 MAX_PROMPT_BYTES = 32_768
 
@@ -22,27 +14,21 @@ class PromptLoadError(ValueError):
 
 
 def load_runtime_prompt(
-    project_root: str | Path,
-    relative_path: str | Path = RUNTIME_PROMPT_PATH,
+    project_root: str | Path, prompt_path: str | Path | None = None
 ) -> str:
-    """Load the fixed thin role core from one project root.
+    """Load the thin role core from one project root.
 
-    `relative_path` is the configured role-core file. It is resolved against
-    `project_root` and must stay inside it, so a mistyped or hostile config
-    cannot read arbitrary files. Nothing is substituted on failure: a missing or
-    invalid prompt fails closed instead of falling back to a default persona.
+    默认路径是 RUNTIME_PROMPT_PATH；调用方可以传配置里的相对路径，
+    让使用者自备角色核心（路径仍必须落在 project_root 之内）。
     """
     if not isinstance(project_root, (str, Path)):
         raise TypeError("project_root must be a path")
     if isinstance(project_root, str) and not project_root.strip():
         raise ValueError("project_root must not be empty")
-    if not isinstance(relative_path, (str, Path)):
-        raise TypeError("relative_path must be a path")
-    if isinstance(relative_path, str) and not relative_path.strip():
-        raise ValueError("relative_path must not be empty")
 
     root = Path(project_root).resolve()
-    prompt_path = root / Path(relative_path)
+    relative = RUNTIME_PROMPT_PATH if prompt_path is None else Path(prompt_path)
+    prompt_path = root / relative
     if not prompt_path.is_file():
         raise PromptLoadError("runtime prompt is missing")
     try:

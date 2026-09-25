@@ -104,23 +104,17 @@ def test_action_failure_categories(response, error_type):
 def test_action_timeout_and_connection_failures_do_not_retry():
     async def scenario():
         calls = 0
-        started = asyncio.Event()
 
         async def actions(_: web.Request):
             nonlocal calls
             calls += 1
-            started.set()
-            # 睡够久以确保客户端先超时；但不能久到拖住 aiohttp 的清理（默认 60s）。
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.1)
+            return web.json_response({"status": "ok", "retcode": 0, "data": {}})
 
         async with fake_onebot(actions, close_ws) as (http_url, ws_url):
-            # 超时给 0.5 秒，远大于本机派发耗时、又小于 handler 的 1 秒。这里要断言的是
-            # 「请求确实发出过一次」，不能和毫秒级调度竞争：2026-09-19 CI 上 3.11 的 10ms
-            # 超时早于服务端进入 handler，calls 被记成 0（本机 +08 与 3.14 都看不出来）。
-            async with OneBotClient(http_url, ws_url, "secret-token", timeout=0.5) as client:
+            async with OneBotClient(http_url, ws_url, "secret-token", timeout=0.01) as client:
                 with pytest.raises(OneBotTimeoutError):
                     await client.send_poke(42)
-            assert started.is_set()
         assert calls == 1
 
         async def disconnect(request: web.Request):

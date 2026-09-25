@@ -361,6 +361,97 @@ def test_yesterday_opens_yesterdays_episode(tmp_path):
         database.close()
 
 
+def test_last_night_opens_yesterdays_episode(tmp_path):
+    """2026-09-22 真机回归：「昨晚」此前不在任何日期词表里，指针落到 none，展开永不发生。
+
+    用户 09-22 早上连续 5 轮用「昨晚」指前一夜（「昨晚你抓住我的手腕…，这个你忘啦」），
+    五轮全部 reason=none/day_missing、0 条明细，她只能回答「我这边没摊开细节」。
+    """
+
+    database = Database(tmp_path / "date-last-night.sqlite3")
+    try:
+        events = EventRepository(database)
+        last_night, _ = _episode(
+            database, events, key="n", at=NOW - timedelta(days=1),
+            texts=("我抓住你的手腕往你腿间带，问你今晚还撑不撑得住",),
+        )
+        older, _ = _episode(
+            database, events, key="o", at=NOW - timedelta(days=3),
+            texts=("这是更早那天的事",),
+        )
+        application = app(database, FakeLLM(["回复"]), FakeNapCat())
+
+        # 问句只带日期词、不逐字复述那一段，好把这一条锁在日期判据上。
+        rendered, event_id = _turn_with_event(
+            application, events, "昨晚那段你还记得吗，具体说说", "date-ln"
+        )
+        details = _context_trace(database, event_id)
+
+        # 指针键是 date_now（过去那天），规则名 day——修复前这里是 none、什么都不展开。
+        assert details["memory_detail_key"] == "date_now", "「昨晚」要解析成过去那一天，不是 none"
+        assert details["memory_detail_reason"] == "day"
+        assert last_night in details["memory_detail_fragments"]
+        # 只看展开块：常用足迹本来就会常驻最近几天的原话，不能用它判展开与否。
+        block = _detail_block(rendered)
+        assert "我抓住你的手腕往你腿间带" in block, "点名的那一段必须被展开"
+        assert "这是更早那天的事" not in block, "不许把更早的段顶上来"
+    finally:
+        database.close()
+
+
+def test_this_morning_points_at_today_not_yesterday(tmp_path):
+    """不误判：合体写法要落到它自己那一天——今早是今天，不是昨天。"""
+
+    database = Database(tmp_path / "date-this-morning.sqlite3")
+    try:
+        events = EventRepository(database)
+        this_morning, _ = _episode(
+            database, events, key="m", at=NOW - timedelta(minutes=30),
+            texts=("今早我又赖了一会儿床",),
+        )
+        yesterday, _ = _episode(
+            database, events, key="y", at=NOW - timedelta(days=1),
+            texts=("昨天傍晚我跟你说过一句话",),
+        )
+        application = app(database, FakeLLM(["回复"]), FakeNapCat())
+
+        rendered, event_id = _turn_with_event(application, events, "细说今早那次", "date-tm")
+        details = _context_trace(database, event_id)
+
+        assert details["memory_detail_key"] == "today"
+        assert this_morning in details["memory_detail_fragments"]
+        block = _detail_block(rendered)
+        assert "今早我又赖了一会儿床" in block
+        assert "昨天傍晚我跟你说过一句话" not in block, "今早不该把昨天那一段也摊开"
+    finally:
+        database.close()
+
+
+def test_the_verbatim_check_ignores_edge_punctuation_only():
+    """2026-09-22 真机：模型抄她的话时在末尾补了一个「。」（她那条以颜文字结尾、原文没有
+    句号），判失败 → 整个整合任务失败 → 记忆水位钉住 8 小时。两端句读不算内容。"""
+
+    from qichi.domain.events import quote_is_verbatim
+
+    source = "主人，腿间那点水已经流到腿根了，手往下挪挪，别只顾着上头那两点 (´-ω`)"
+    assert quote_is_verbatim(source + "。", source) is True, "末尾补句读要放过"
+    assert quote_is_verbatim("  " + source + "  ", source) is True, "两端空白要放过"
+    assert quote_is_verbatim("「" + source + "」", source) is True, "两端引号要放过"
+
+
+def test_the_verbatim_check_still_rejects_any_change_in_the_middle():
+    """不误判：只放过两端句读——中间改一个字、或只有句读，都必须被拒。"""
+
+    from qichi.domain.events import quote_is_verbatim
+
+    source = "主人，腿间那点水已经流到腿根了，手往下挪挪"
+    assert quote_is_verbatim("主人，腿间那点水已经流到腿根了，手往下动动", source) is False, "中间改字要拒"
+    assert quote_is_verbatim("主人腿上那点水已经流到腿根了，手往下挪挪", source) is False, "中间少字要拒"
+    assert quote_is_verbatim("。。", source) is False, "只有句读的引文不算数"
+    assert quote_is_verbatim("", source) is False, "空引文不算数"
+    assert quote_is_verbatim(source, None) is False, "没有来源就没有逐字"
+
+
 def test_a_day_with_no_episode_unfolds_nothing(tmp_path):
     database = Database(tmp_path / "date-missing.sqlite3")
     try:
@@ -780,6 +871,10 @@ def test_the_hour_windows_come_from_the_words_the_user_used():
     assert time_of_day_hours("昨天下午") == ((13, 17),)
     assert time_of_day_hours("今天中午和九号中午") == ((11, 13),)
     assert time_of_day_hours("今天天气不错") == ()
+    # 2026-09-22：合体写法（哪一天 + 哪个时段）此前一个都没被认出来。
+    assert time_of_day_hours("昨晚") == ((17, 24),)
+    assert time_of_day_hours("昨夜") == ((17, 24),)
+    assert time_of_day_hours("今晚我要加班") == ((17, 24),)
     assert [band_label(hour) for hour in (1, 7, 9, 12, 15, 21)] == [
         "凌晨", "早上", "上午", "中午", "下午", "晚上"
     ]

@@ -243,7 +243,7 @@ def test_constructor_and_inputs_are_strict(protocol):
     with pytest.raises((TypeError, ValueError)):
         protocol.parse("x", source="dialogue", current_event_handle="M1", context_version=True)
 
-# --- 语音控制行 [[qq:voice:N]]（2026-09-14，见历史TTS计划 §3.3）---
+# --- 语音控制行 [[qq:voice:N]]（2026-09-14，见 doc/TTS-实施计划-20260914.md §3.3）---
 
 
 def test_voice_marker_selects_a_part_and_never_leaks_into_the_body(protocol):

@@ -28,6 +28,10 @@ _MARKER_PREFIX: Final = re.compile(r"\[\[(?:qq|qichi):")
 _QQ_LINE: Final = re.compile(r"^\[\[qq:(reply|face|react|voice):([^:\[\]\r\n]+)\]\]$")
 # 语音只认"第几段"（1 起）。裸 [[qq:voice]] 没有冒号，会走上面的 invalid 分支 fail closed。
 _VOICE_INDEX: Final = re.compile(r"^[1-9][0-9]?$")
+# 2026-09-20：共同想象场景状态。取值只有 on/off；形态不对（[[qq:scene]]、
+# [[qq:scene:maybe]]）不是协议错误——丢掉这个动作、正文照发，与语音越界同一风格。
+_SCENE_LINE: Final = re.compile(r"^\[\[qq:scene(?::([^:\[\]\r\n]+))?\]\]$")
+_SCENE_MARKS: Final = frozenset({"on", "off"})
 _MAX_NATIVE_ACTIONS: Final = 3
 _QQ_PREFIX_LINE: Final = re.compile(r"^\[\[qq:")
 _QICHI_PREFIX_LINE: Final = re.compile(r"^\[\[qichi:")
@@ -176,6 +180,18 @@ class ResponseProtocol:
         for line in lines:
             bare = line.rstrip("\r\n")
             if _QQ_PREFIX_LINE.match(bare):
+                scene = _SCENE_LINE.fullmatch(bare)
+                if scene is not None:
+                    # 无论取值合法与否都当控制行剥掉：留着它只会把标记当正文发出去。
+                    classified_lines.append((line, True))
+                    value = scene.group(1)
+                    if value in _SCENE_MARKS:
+                        controls.append(("scene", value))
+                    else:
+                        _LOGGER.warning(
+                            "invalid_scene_mark (value=%r); action dropped, body kept", value
+                        )
+                    continue
                 marker = _QQ_LINE.fullmatch(bare)
                 if marker is None:
                     raise ResponseProtocolError("invalid qq control marker")
@@ -193,13 +209,17 @@ class ResponseProtocol:
         # remain an ambiguity and are still rejected below.
         controls = list(dict.fromkeys(controls))
 
-        if len(controls) > _MAX_NATIVE_ACTIONS:
+        # 场景标记是**模式状态**，不是原生动作：它不占 reply/face/react/voice 的预算，
+        # 否则多带一个标记就会把原本合法的回复打成协议错误。
+        native_controls = [control for control in controls if control[0] != "scene"]
+        if len(native_controls) > _MAX_NATIVE_ACTIONS:
             raise ResponseProtocolError("too many control markers")
 
         replies = [(kind, value) for kind, value in controls if kind == "reply"]
         expressions = [(kind, value) for kind, value in controls if kind in {"face", "react"}]
         voices = [(kind, value) for kind, value in controls if kind == "voice"]
-        if len(replies) > 1 or len(expressions) > 1 or len(voices) > 1:
+        scenes = [(kind, value) for kind, value in controls if kind == "scene"]
+        if len(replies) > 1 or len(expressions) > 1 or len(voices) > 1 or len(scenes) > 1:
             raise ResponseProtocolError("duplicate control action")
 
         text = _without_control_regions(classified_lines)
@@ -229,7 +249,7 @@ class ResponseProtocol:
             if _VOICE_INDEX.fullmatch(value) is None:
                 raise ResponseProtocolError("invalid voice control marker")
             # 越界不是协议错误：与她引用了一个解析不到的句柄一样，只放弃这个动作，
-            # 正文照发（2026-09-14 裁定，见历史TTS计划 §3.3）。
+            # 正文照发（2026-09-14 裁定，见 doc/TTS-实施计划-20260914.md §3.3）。
             if int(value) <= len(parts):
                 voice_part_index = int(value)
             else:
@@ -249,4 +269,5 @@ class ResponseProtocol:
             context_version,
             parts,
             voice_part_index,
+            scenes[0][1] if scenes else None,
         )

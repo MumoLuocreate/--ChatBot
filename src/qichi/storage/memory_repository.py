@@ -6,7 +6,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
-from qichi.domain.memory import MemoryEvidence, MemoryRecord, MemoryReview
+from qichi.domain.events import quote_is_verbatim
+from qichi.domain.memory import (
+    MEMORY_RELIABLE_SOURCES,
+    MemoryEvidence,
+    MemoryRecord,
+    MemoryReview,
+)
 from qichi.memory.lexical import match_count, query_fragments
 
 from .database import Database
@@ -49,7 +55,7 @@ def _outbound_source(metadata_json: object) -> bool:
     if not isinstance(value, dict):
         return False
     generation = value.get("generation_metadata")
-    return isinstance(generation, dict) and generation.get("source") in {"dialogue", "interaction"}
+    return isinstance(generation, dict) and generation.get("source") in MEMORY_RELIABLE_SOURCES
 
 
 def _nonempty_text(value: object, field: str) -> str:
@@ -277,6 +283,92 @@ class MemoryRepository:
                 after,
                 "legacy_manual_review",
                 record.assessed_at_utc or record.created_at_utc,
+            )
+            return after
+
+    def restore(self, memory_id: str, *, at_utc: datetime | None = None) -> MemoryRecord:
+        """把一个被 reject/expire 的记录恢复到**移除前的状态**（人工动作，卡B③）。
+
+        用户 2026-09-22 裁定（R1）：移出必须可逆；且语义要准确（faithful 路线：
+        新增 restore 审计动作 + schema 7 迁移），而不是只把状态翻回去。
+
+        为什么不能只翻状态：expire/reject 的 review 会把 certainty 降成
+        unsupported、importance 置 0、temporal_scope 置 unclassified。只改 status
+        会造出一条 active 却 unsupported 的记录——违反激活矩阵，context_builder 会
+        直接拒绝它进工作集，等于「恢复了但永远看不到」。
+
+        所以：状态与评级字段一律取自那条移出审计事件的 before_*；原因码取该状态
+        最后一次被建立时写下的那个（移除事件自己存的是移除理由，不是原理由）。
+        证据一个字都不动，也不新增证据。审计写一条 restore（before=终态、after=恢复后）。
+
+        有意不开放给提取器：allowed_review_actions 里没有 restore——模型不能撤销
+        自己的判决，否则它会来回反复且失去审计意义。这只能是人在维护入口按的一次动作。
+        """
+
+        memory_id = _nonempty_text(memory_id, "memory_id")
+        with self.database.transaction() as connection:
+            record = self._get(connection, memory_id)
+            if record.status not in {"rejected", "expired"}:
+                raise ValueError(f"cannot restore from {record.status}")
+            removal = connection.execute(
+                "SELECT occurred_at_utc, before_status, before_certainty, before_importance, "
+                "before_temporal_scope FROM memory_audit_events "
+                "WHERE memory_id = ? AND action IN ('reject', 'expire') "
+                "AND after_status IN ('rejected', 'expired') "
+                "ORDER BY occurred_at_utc DESC, audit_event_id DESC LIMIT 1",
+                (memory_id,),
+            ).fetchone()
+            if removal is None:
+                raise ValueError("memory has no removal audit event to restore from")
+            target_status = removal["before_status"]
+            if target_status is None or removal["before_certainty"] is None:
+                raise ValueError("removal audit event does not record a restorable state")
+            previous = connection.execute(
+                "SELECT assessment_reason_code FROM memory_audit_events "
+                "WHERE memory_id = ? AND after_status = ? AND occurred_at_utc <= ? "
+                "ORDER BY occurred_at_utc DESC, audit_event_id DESC LIMIT 1",
+                (memory_id, target_status, removal["occurred_at_utc"]),
+            ).fetchone()
+            if previous is None:
+                raise ValueError("memory has no prior grading reason to restore")
+            # 时间戳用**人工动作发生的那一刻**，不是移除那一刻：否则审计链里
+            # restore 会与移出同刻、甚至排在它前面，时间顺序就不可信了。
+            # 被恢复的**评级值**仍然取自移除事件，两者是两件事。
+            restored_at = at_utc if at_utc is not None else datetime.now(timezone.utc)
+            if not isinstance(restored_at, datetime):
+                raise TypeError("at_utc must be a datetime or None")
+            restored_scope = removal["before_temporal_scope"]
+            if restored_scope == "bounded" and record.valid_until_utc is None:
+                raise ValueError("bounded memory cannot be restored without valid_until_utc")
+            cursor = connection.execute(
+                "UPDATE memory_records SET status = ?, certainty = ?, importance = ?, "
+                "temporal_scope = ?, assessment_reason_code = ?, assessed_at_utc = ? "
+                "WHERE memory_id = ? AND status = ?",
+                (
+                    target_status,
+                    removal["before_certainty"],
+                    removal["before_importance"],
+                    restored_scope,
+                    previous["assessment_reason_code"],
+                    restored_at.isoformat(),
+                    memory_id,
+                    record.status,
+                ),
+            )
+            if cursor.rowcount != 1:
+                self._raise_transition_error(connection, memory_id, "restore")
+            after = self._get(connection, memory_id)
+            if after.status == "active":
+                self._validate_active_evidence(after)
+            self._write_audit(
+                connection,
+                memory_id,
+                _LEGACY_API_SESSION_JOB,
+                "restore",
+                record,
+                after,
+                previous["assessment_reason_code"],
+                restored_at,
             )
             return after
 
@@ -1286,7 +1378,7 @@ class MemoryRepository:
             if _stored_utc(row["occurred_at_utc"], "event occurred_at_utc") != evidence.occurred_at_utc:
                 raise ValueError("evidence time does not match source event")
             text = row["text"]
-            if not isinstance(text, str) or evidence.exact_quote not in text:
+            if not isinstance(text, str) or not quote_is_verbatim(evidence.exact_quote, text):
                 raise ValueError("evidence exact quote is absent from source event")
             conversations.add(_nonempty_text(row["conversation_id"], "event conversation_id"))
         if len(conversations) != 1:

@@ -23,8 +23,8 @@
     {"event_id":"e07","actor":"mumo","direction":"inbound","kind":"text","text":"现在傍晚了，别把昨晚当眼前。","occurred_at":"2026-08-28T10:30:00+00:00"},
     {"event_id":"e08","actor":"mumo","direction":"inbound","kind":"image","text":null,"media":["image"],"occurred_at":"2026-08-28T10:31:00+00:00"},
     {"event_id":"e09","actor":"mumo","direction":"inbound","kind":"text","text":"你能看见刚才那张图吗？","occurred_at":"2026-08-28T10:31:30+00:00"},
-    {"event_id":"e10","actor":"mumo","direction":"inbound","kind":"text","text":"想象里我先起个头，你愿意就接下去。","occurred_at":"2026-08-28T10:33:00+00:00"},
-    {"event_id":"e11","actor":"qichi","direction":"outbound","kind":"text","text":"那我就接下去，也承认我偏向你。","occurred_at":"2026-08-28T10:33:20+00:00"},
+    {"event_id":"e10","actor":"mumo","direction":"inbound","kind":"text","text":"想象里我先牵住你，你愿意就接住。","occurred_at":"2026-08-28T10:33:00+00:00"},
+    {"event_id":"e11","actor":"qichi","direction":"outbound","kind":"text","text":"那我接住，也承认我偏心你。","occurred_at":"2026-08-28T10:33:20+00:00"},
     {"event_id":"e12","actor":"mumo","direction":"inbound","kind":"text","text":"没有工具结果时别说已经查过。","occurred_at":"2026-08-28T10:35:00+00:00"},
     {"event_id":"e13","actor":"platform","direction":"internal","kind":"tool_result","text":"本轮提供了脱敏工具结果。","media":["tool_result"],"occurred_at":"2026-08-28T10:36:00+00:00"}
   ]

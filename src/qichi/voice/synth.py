@@ -1,6 +1,6 @@
 """语音合成客户端：一次 HTTP 调用，拿回一段音频字节。
 
-实测形状（2026-09-14，见历史TTS计划 §2.10）：
+实测形状（2026-09-14，见 doc/TTS-实施计划-20260914.md §2.10）：
     POST {base_url}/services/aigc/multimodal-generation/generation
     {"model": ..., "input": {"text": ..., "voice": ...},
      "parameters": {"language_type": "Chinese", "instructions": ...}}

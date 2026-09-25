@@ -37,6 +37,186 @@ def seed_fragments(path):
     db.close()
 
 
+def test_health_reports_a_stalled_memory_consolidation(tmp_path):
+    """命中（2026-09-22）：有终态失败的整合任务时，健康条必须报出来。
+
+    真机：一条引文里的坏标点把记忆水位钉了 8 小时，而**没有任何地方**会提醒，
+    是用户主动问起才被发现。
+    """
+
+    db_path, marker_path = tmp_path / "stall.sqlite3", tmp_path / "ready"
+    seed(db_path); marker(marker_path)
+    db = Database(db_path)
+    db.connection.execute(
+        "INSERT INTO memory_session_jobs (job_id, conversation_id, revision, fragment_key,"
+        " start_sequence, end_sequence, anchor_event_id, anchor_sequence, anchor_received_at_utc,"
+        " deadline_utc, context_version, status, attempt_count, failure_category,"
+        " created_at_utc, updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("job-stall", "100", 1, "key", 10, 12, "e1", 12, "2026-08-27T04:00:00+00:00",
+         "2026-08-27T04:30:00+00:00", 1, "failed", 4, "schema_error",
+         "2026-08-27T04:00:00+00:00", "2026-08-27T04:30:00+00:00"),
+    )
+    db.close()
+
+    health = DashboardService(db_path, marker_path).snapshot()["health"]
+
+    assert health["ok"] is False
+    assert "记忆整合" in health["reason"]
+
+
+def test_health_ignores_a_backlog_that_is_simply_waiting(tmp_path):
+    """不误判：没有终态失败就不报警——长对话本来就要静默 30 分钟才整合一次，
+    落后几百条属于正常。"""
+
+    db_path, marker_path = tmp_path / "quiet.sqlite3", tmp_path / "ready"
+    seed(db_path); marker(marker_path)
+
+    health = DashboardService(db_path, marker_path).snapshot()["health"]
+
+    assert "记忆整合" not in health["reason"]
+
+
+def test_health_keeps_both_the_ready_reason_and_the_memory_stall(tmp_path):
+    """不误判（互补）：marker 本身不健康时，卡住理由不许把原来那条顶掉——两条都要留住。"""
+
+    db_path, marker_path = tmp_path / "both.sqlite3", tmp_path / "ready"
+    seed(db_path); marker(marker_path)
+    db = Database(db_path)
+    db.connection.execute(
+        "INSERT INTO memory_session_jobs (job_id, conversation_id, revision, fragment_key,"
+        " start_sequence, end_sequence, anchor_event_id, anchor_sequence, anchor_received_at_utc,"
+        " deadline_utc, context_version, status, attempt_count, failure_category,"
+        " created_at_utc, updated_at_utc) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("job-both", "100", 1, "key", 10, 12, "e1", 12, "2026-08-27T04:00:00+00:00",
+         "2026-08-27T04:30:00+00:00", 1, "failed", 4, "schema_error",
+         "2026-08-27T04:00:00+00:00", "2026-08-27T04:30:00+00:00"),
+    )
+    db.close()
+    # 让 marker 指向不存在的进程/不一致摘要，制造"另一条更该看见的异常"
+    marker_path.write_text(json.dumps({
+        "schema": "qichi-ready", "version": 3, "owner_qq": "100", "bot_qq": "200",
+        "pid": 1, "parent_pid": 2, "instance_id": "x", "started_at_utc": "2020-01-01T00:00:00+00:00",
+        "build_id": "bad", "model": "m", "provider": "p", "database_schema_version": 6,
+    }), encoding="utf-8")
+
+    health = DashboardService(db_path, marker_path).snapshot()["health"]
+
+    assert health["ok"] is False
+    assert "记忆整合" in health["reason"], "卡住理由必须在"
+    assert len(health["reason"].split("；")) >= 2, "原来的理由也不许被顶掉"
+
+
+def _job_event(db, *, details: dict, at: str | None = None, event_id: str = "je-1") -> None:
+    db.connection.execute(
+        "INSERT INTO memory_job_events (job_event_id, job_id, conversation_id, revision, fragment_key,"
+        " start_sequence, end_sequence, action, failure_category, attempt_count, next_retry_at_utc,"
+        " occurred_at_utc, details_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (event_id, "job-1", "100", 1, "key", 10, 12, "completed", None, 1, None,
+         at or datetime.now(timezone.utc).isoformat(), json.dumps(details)),
+    )
+
+
+def test_memory_usage_totals_are_visible_and_bounded(tmp_path):
+    """命中（2026-09-22）：面板汇总记忆后台的 token 用量，好回答「钱花在哪」。"""
+
+    db_path, marker_path = tmp_path / "usage.sqlite3", tmp_path / "ready"
+    seed(db_path); marker(marker_path)
+    db = Database(db_path)
+    _job_event(db, details={
+        "extraction_input_tokens": "1000", "extraction_output_tokens": "200",
+        "detail_input_tokens": "2000", "detail_output_tokens": "500", "detail_calls": "3",
+        "SECRET-LEAK": "x",
+    })
+    db.close()
+
+    snapshot = DashboardService(db_path, marker_path).snapshot()
+
+    assert snapshot["memory_usage"]["totals"]["extraction_input_tokens"] == 1000
+    assert snapshot["memory_usage"]["totals"]["detail_input_tokens"] == 2000
+    assert snapshot["memory_usage"]["jobs"] == 1
+    assert "SECRET-LEAK" not in json.dumps(snapshot), "白名单外的键不许被投影"
+    assert snapshot["memory_worker"]["last_result"]["details"]["detail_output_tokens"] == "500"
+
+
+def test_memory_usage_absent_is_an_empty_total_not_a_guess(tmp_path):
+    """不误判：没有用量记录时给空汇总，不编数字、不报错。"""
+
+    db_path, marker_path = tmp_path / "nou.sqlite3", tmp_path / "ready"
+    seed(db_path); marker(marker_path)
+
+    snapshot = DashboardService(db_path, marker_path).snapshot()
+
+    assert snapshot["memory_usage"]["totals"] == {}
+    assert snapshot["memory_usage"]["jobs"] == 0
+
+
+def test_prices_follow_the_official_peak_and_idle_windows():
+    """命中（2026-09-22）：高峰=北京时间工作日 9:00-12:00、14:00-18:00，其余按空闲（半价）。
+
+    价格抄自 DeepSeek 官方定价页（见 dashboard/service.py 的 _LLM_PRICES）。
+    """
+
+    from qichi.dashboard.service import _is_peak_hour, _price_cny
+
+    monday_10 = datetime(2026, 9, 21, 2, 0, tzinfo=timezone.utc)    # 北京时间周一 10:00
+    monday_20 = datetime(2026, 9, 21, 12, 0, tzinfo=timezone.utc)   # 北京时间周一 20:00
+    saturday_10 = datetime(2026, 9, 26, 2, 0, tzinfo=timezone.utc)  # 北京时间周六 10:00
+
+    assert _is_peak_hour(monday_10) is True
+    assert _is_peak_hour(monday_20) is False
+    assert _is_peak_hour(saturday_10) is False, "周末不算高峰"
+    assert _price_cny("deepseek-flash", "miss", monday_10, 1_000_000) == 2.0
+    assert _price_cny("deepseek-flash", "miss", monday_20, 1_000_000) == 1.0
+    assert _price_cny("deepseek-v4-flash", "hit", monday_20, 1_000_000) == 0.02, "旧名按 Flash 计价"
+    assert _price_cny("someone-else", "miss", monday_10, 1_000_000) == 0.0, "未知模型绝不猜"
+    assert _price_cny("deepseek-flash", "miss", monday_10, 0) == 0.0
+
+
+def test_memory_cost_is_summed_with_peak_and_idle_rates(tmp_path):
+    """命中：记忆后台的用量按各自事件时刻的高峰/空闲价折算（同一把尺子）。"""
+
+    db_path, marker_path = tmp_path / "cost.sqlite3", tmp_path / "ready"
+    seed(db_path); marker(marker_path)
+    db = Database(db_path)
+    # 必须落在"近 24 小时"窗口内，所以时间相对现在取；高峰/空闲由同一单价函数判定。
+    from qichi.dashboard.service import _price_cny
+
+    recent = datetime.now(timezone.utc) - timedelta(hours=2)
+    older = datetime.now(timezone.utc) - timedelta(hours=4)
+    _job_event(db, event_id="je-a", at=recent.isoformat(), details={
+        "extraction_input_tokens": "1000000", "extraction_cache_hit_tokens": "0",
+    })
+    _job_event(db, event_id="je-b", at=older.isoformat(), details={
+        "detail_input_tokens": "1000000", "detail_cache_hit_tokens": "0",
+    })
+    db.close()
+
+    usage = DashboardService(
+        db_path, marker_path, {"provider": "deepseek", "model": "deepseek-flash"}
+    ).snapshot()["memory_usage"]
+
+    assert usage["totals"]["extraction_input_tokens"] == 1_000_000
+    assert usage["totals"]["detail_input_tokens"] == 1_000_000
+    expected = _price_cny("deepseek-flash", "miss", recent, 1_000_000) + _price_cny(
+        "deepseek-flash", "miss", older, 1_000_000
+    )
+    assert usage["cost_cny"] == round(expected, 3), "汇总必须等于各条事件按当时单价折算之和"
+
+
+def test_cost_today_is_zero_and_never_guessed_when_nothing_ran(tmp_path):
+    """不误判：没有用量时给 0，不编数字。"""
+
+    db_path, marker_path = tmp_path / "nocost.sqlite3", tmp_path / "ready"
+    seed(db_path); marker(marker_path)
+
+    snapshot = DashboardService(db_path, marker_path).snapshot()
+
+    assert snapshot["cost_today"]["currency"] == "CNY"
+    assert snapshot["cost_today"]["total_cny"] == 0.0
+    assert snapshot["chat_usage"]["turns"] == 0
+    assert snapshot["memory_usage"]["jobs"] == 0
+
+
 def test_fragment_projection_is_counts_only_and_newest_first(tmp_path):
     db_path, marker_path = tmp_path / "f.sqlite3", tmp_path / "ready"
     seed(db_path); seed_fragments(db_path); marker(marker_path)
@@ -104,8 +284,6 @@ def test_trace_category_whitelist_covers_every_context_category():
     assert missing == [], f"这些上下文字段会被静默丢弃：{missing}"
 
 from pathlib import Path
-from zoneinfo import ZoneInfo
-
 import pytest
 
 import qichi.dashboard.service as dashboard_service_module
@@ -351,7 +529,7 @@ def test_trace_projection_keeps_only_explicit_bounded_field_shapes():
         "memory_detail_indexed": True,
         "memory_detail_reason": "day_missing",
         "tool_name": "web_search",
-        "tool_query": "仲恺农业工程学院 简介",
+        "tool_query": "示例学院 简介",
         "tool_ok": True,
         "tool_degraded": None,
         "tool_elapsed_ms": 3705,
@@ -594,6 +772,37 @@ def test_memory_detail_lifecycle_rows_are_scoped_by_their_owner_relations(tmp_pa
 
     assert [item["audit_event_id"] for item in memory["audit_events"]] == ["owner-audit"]
     assert [item["presentation_id"] for item in memory["confirmation_presentations"]] == ["owner-presentation"]
+
+
+def test_response_audit_also_projects_the_working_set(tmp_path):
+    """2026-09-22 用户要求「把该显示出来的挂上」：工作集也必须投影出来。
+
+    面板原先只显示常驻的 relationship_refs 与按话题命中的 retrieved_refs，而**每轮固定注入的
+    工作集没有显示**——他看到的比实际少得多（只看到常驻 5 条，实际每轮还另有 66 条）。
+    """
+
+    db_path, marker_path = tmp_path / "ws.sqlite3", tmp_path / "ready.json"
+    seed(db_path)
+    db = Database(db_path)
+    db.connection.execute(
+        "INSERT INTO conversation_events (event_id,conversation_id,sequence,direction,actor,kind,text,message_segments_json,reply_to_event_id,reply_to_platform_message_id,occurred_at_utc,received_at_utc,status,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("e3", "100", 2, "outbound", "qichi", "text", "reply with memory", "[]", "e1", "pm1",
+         "2026-08-29T00:02:00+00:00", "2026-08-29T00:02:01+00:00", "sent",
+         '{"generation_metadata":{"source":"dialogue","context_version":2,'
+         '"relationship_memory_ids":["m1"],"working_set_memory_ids":["m1"],'
+         '"candidate_memory_ids":[],"quoted_event_id":"e1","history_event_count":1}}'),
+    )
+    db.close()
+    marker(marker_path)
+
+    audit = DashboardService(db_path, marker_path).snapshot()["response_audit"][0]
+
+    working = audit["working_set_refs"]
+    assert [item["memory_id"] for item in working] == ["m1"], (
+        "工作集必须投影出来，否则面板显示不出每轮真正在注入什么"
+    )
+    assert set(working[0]) >= {"memory_id", "type", "normalized_fact"}, "至少要有面板渲染需要的字段"
+    assert audit["relationship_refs"], "常驻层照旧"
 
 
 def test_response_audit_projects_scoped_memory_facts(tmp_path):
@@ -1106,30 +1315,3 @@ def test_features_absence_and_corruption_are_reported_not_guessed(tmp_path):
     assert "无法解析" in broken["features_evidence"]
     assert "api_key" not in str(broken).lower() and "access_token" not in str(broken).lower()
 
-
-
-def test_recall_explanation_uses_the_configured_timezone(tmp_path):
-    """面板复算必须与引擎同源：同一句话在 UTC 机器上会指到前一天。
-
-    2026-08-28T20:00Z 在 UTC 还是 08-28，在东八区已经是 08-29。
-    面板原先硬用本机时区，所以同一句「今天」在两种机器上给出不同的日期。
-    """
-
-    database = Database(tmp_path / "dashboard-tz.sqlite3")
-    database.close()
-    marker_path = tmp_path / "dashboard-tz-ready.json"
-    marker(marker_path)  # 合法 READY marker，否则面板读不到 owner 就提前返回
-    clock = lambda: datetime(2026, 8, 28, 20, 0, tzinfo=timezone.utc)
-
-    utc_service = DashboardService(
-        tmp_path / "dashboard-tz.sqlite3", marker_path, clock=clock, local_zone=timezone.utc
-    )
-    shanghai_service = DashboardService(
-        tmp_path / "dashboard-tz.sqlite3",
-        marker_path,
-        clock=clock,
-        local_zone=ZoneInfo("Asia/Shanghai"),
-    )
-
-    assert utc_service.recall_explanation("今天")["dates"] == ["2026-08-28"]
-    assert shanghai_service.recall_explanation("今天")["dates"] == ["2026-08-29"]

@@ -1,6 +1,6 @@
 """把"她要说的那一段"变成一条真实的 QQ 语音，并收好每一个失败方向。
 
-时序（2026-09-14 定，见历史TTS计划 §3.1）：
+时序（2026-09-14 定，见 doc/TTS-实施计划-20260914.md §3.1）：
     文字组发完 -> 【本模块，后台任务】剥离 -> 写语气指令 -> 合成 -> 建事件 -> 派发 -> 颜文字残段
 
 失败方向一律**不吞掉她的话**：
@@ -40,6 +40,16 @@ class VoiceJob:
     situation: str = ""
     reply_target_event_id: str | None = None
     reply_target_platform_message_id: str | None = None
+    # 2026-09-20：这一轮由什么触发（dialogue / interaction / initiative）。
+    # 语音只是**投递形态**，不是另一种内容——记忆的可靠判据
+    # （MemoryWorker._is_reliable）认的就是 generation_metadata.source，
+    # 所以这里必须把**真实来源**带下去，不许硬编码。真机 88 条语音因为
+    # 缺这个字段而永远进不了记忆，见 doc/问题冻结-20260920-语音进记忆.md。
+    source: str = "dialogue"
+
+    def __post_init__(self) -> None:
+        if self.source not in {"dialogue", "interaction", "initiative"}:
+            raise ValueError("source must be dialogue, interaction, or initiative")
 
 
 @dataclass(frozen=True)
@@ -143,7 +153,9 @@ class VoiceDispatcher:
                     "file": str(clip.path),
                     "part_index": job.part_index,
                     "part_count": job.part_count,
-                }
+                },
+                # 只带 source：记忆那一侧只需要它，别的字段由文字组自己承担。
+                "generation_metadata": {"source": job.source},
             },
         )
         try:
@@ -170,7 +182,11 @@ class VoiceDispatcher:
             occurred_at_utc=self._clock(),
             received_at_utc=self._clock(),
             status="pending",
-            metadata={"voice": {"degraded": reason}},
+            metadata={
+                "voice": {"degraded": reason},
+                # 降级发出去的同样是她的原话，来源一样要带上，否则这句话进不了记忆。
+                "generation_metadata": {"source": job.source},
+            },
         )
         try:
             event = self.events.insert(candidate)
@@ -209,6 +225,9 @@ class VoiceDispatcher:
                     occurred_at_utc=timestamp,
                     received_at_utc=timestamp,
                     status="pending",
+                    # 有意**不带** generation_metadata：残段只是从语音里剥出来的颜文字，
+                    # 而语音事件的 text 里已经含它一次（9393 以「(￣▽￣)」结尾、9394 又是
+                    # 「(￣▽￣)」），进记忆会在明细里留一条重复的装饰行。
                     metadata={"voice_residue": {"part_event_id": part_event_id}},
                 )
             )

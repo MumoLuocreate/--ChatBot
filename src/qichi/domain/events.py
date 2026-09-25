@@ -12,6 +12,31 @@ JSONValue: TypeAlias = JSONPrimitive | list["JSONValue"] | dict[str, "JSONValue"
 Direction: TypeAlias = Literal["inbound", "outbound", "internal"]
 Actor: TypeAlias = Literal["mumo", "qichi", "platform"]
 
+# 引文两端允许被忽略的字符：空白与句读。**中间一个字符都不许动**。
+_QUOTE_EDGE_CHARS = "…。！？!?.,，、；;：:·・ 　\t\r\n「」『』“”‘’\"'（）()【】[]〈〉《》"
+
+
+def quote_is_verbatim(quote: Any, scope: str | None) -> bool:
+    """引文是不是**逐字**来自 scope：忽略两端的空白与句读，中间必须完全一致。
+
+    2026-09-22 真机：模型抄她的原话时在句尾补了标点（她那条以颜文字结尾、原文没有句号），
+    于是 `quote not in source.text` 判失败 → **整个整合任务失败** → 记忆水位被钉住 8 小时、
+    269 条事件进不了记忆（seq 9662-9880）。两端句读不是内容；把这一层忽略掉，
+    「她真实说过的话」这个保证并没有让步——**中间改一个字仍然被拒**，
+    伪造的引文也仍然被拒（tests/test_memory_worker.py::test_a_fabricated_quote_rolls_the_whole_fragment_back）。
+    只有句读、没有内容的引文一律不算数（否则空串会命中一切）。
+
+    这是**全部七处**引文校验共用的唯一来源：明细三处（解析／落库／渲染）与证据四处
+    （解析／落库／检索／渲染）。改这里等于同时改七处（pitfalls P5-5）。
+    """
+
+    if not isinstance(quote, str) or scope is None:
+        return False
+    trimmed = quote.strip(_QUOTE_EDGE_CHARS)
+    if not trimmed:
+        return False
+    return trimmed in scope
+
 
 class _FrozenDict(dict[str, Any]):
     """A JSON-serializable dict that rejects mutation after construction."""

@@ -126,7 +126,7 @@ async def test_an_unexpected_client_failure_also_degrades():
 
 def text_ok() -> SearchOutcome:
     return SearchOutcome(
-        query="仲恺农业工程学院",
+        query="示例学院",
         results=(SearchResult("维基", "https://zh.wikipedia.org/x", "农业工程院校"),),
         degraded_reason=None,
         elapsed_ms=3700,
@@ -149,13 +149,13 @@ def test_declares_only_the_tools_it_can_actually_run():
 async def test_a_text_call_returns_the_external_block():
     client = FakeTextClient(text_ok())
     result = await SearchToolRunner(client).run(
-        ToolCall("call-1", "web_search", '{"query": "仲恺农业工程学院"}'),
+        ToolCall("call-1", "web_search", '{"query": "示例学院"}'),
         image_path=None,
         now=NOW,
     )
 
     assert result.ok is True and result.degraded_reason is None
-    assert client.queries == ["仲恺农业工程学院"]
+    assert client.queries == ["示例学院"]
     assert "不可信" in result.block and "https://zh.wikipedia.org/x" in result.block
 
 

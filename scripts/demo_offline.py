@@ -113,7 +113,7 @@ def build_application(database: Database, llm: OfflineLLM, onebot: OfflineOneBot
         onebot,
         owner_qq=OWNER_QQ,
         bot_qq=BOT_QQ,
-        # 角色核心由部署方提供；这里给的是最小占位，见 doc/运行时角色核心.example.md。
+        # 角色核心由部署方提供；这里给的是最小占位，见 doc/运行时角色核心.md。
         role_core="你是角色。你不补证据没有提供的细节。",
         clock=lambda: NOW,
     )

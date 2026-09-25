@@ -49,9 +49,11 @@ from qichi.domain.dialogue import (
     split_voice_part,
 )
 from qichi.domain.events import ConversationEvent
+from qichi.domain.memory import working_set_resident
 from qichi.domain.memory_details import MemoryDetailRecord
 from qichi.memory.dates import (
     names_a_time_of_day,
+    referenced_past_segment,
     referenced_dates,
     time_of_day_anchors,
     time_of_day_hours,
@@ -114,6 +116,64 @@ def _aware_utc(value: datetime, field: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+# 2026-09-20：共同想象场景状态。**只活在进程内存里，刻意不落库**——
+# 迁移是单向的、readiness 又要求库里的 schema 等于代码里的 SCENE_VERSION，所以为了
+# 一个几小时就过期的场景标记把 schema 抬到 7，等于拿整个回滚能力换一个临时状态：
+# 库一旦迁到 7，把代码退回现在这一版就会启动被拒。与 self._last_detail_fragments 同一取向。
+# 兜底 TTL 取 3 小时：实测那几场共同想象都发生在同一晚（片段区间最长约 2.5 小时），
+# 再留一点余量；她标记 on 之后一直没再标记（忘了关或被打断）时，状态自己结束。
+SCENE_STATE_TTL = timedelta(hours=3)
+
+
+@dataclass(frozen=True)
+class _SceneMark:
+    active: bool
+    started_at_utc: datetime | None
+    updated_at_utc: datetime
+
+
+class _SceneMarks:
+    """每会话一条场景标记，只活在内存里；重启后为空，那也只是回到"不在场景里"。"""
+
+    def __init__(self) -> None:
+        self._marks: dict[str, _SceneMark] = {}
+
+    def read(self, conversation_id: str) -> _SceneMark | None:
+        return self._marks.get(conversation_id)
+
+    def is_active(
+        self,
+        conversation_id: str,
+        *,
+        now: datetime,
+        ttl: timedelta | None = SCENE_STATE_TTL,
+    ) -> bool:
+        """True 仅当她标记过 on、且这个标记还没过期。"""
+
+        mark = self._marks.get(conversation_id)
+        if mark is None or not mark.active:
+            return False
+        if ttl is None:
+            return True
+        return _aware_utc(now, "now") - mark.updated_at_utc <= ttl
+
+    def apply(self, conversation_id: str, mark: str, *, now: datetime) -> _SceneMark:
+        """记下一条场景标记。取值只有 on/off（调用方拿到的已经是解析并校验过的）。"""
+
+        if mark not in {"on", "off"}:
+            raise ValueError("scene mark must be on or off")
+        moment = _aware_utc(now, "now")
+        if mark == "on":
+            previous = self._marks.get(conversation_id)
+            # 重复标 on 不移动开始时间：她连着说两句"开始了"仍然只有一次开始。
+            started = previous.started_at_utc if previous is not None and previous.active else None
+            state = _SceneMark(True, started or moment, moment)
+        else:
+            state = _SceneMark(False, None, moment)
+        self._marks[conversation_id] = state
+        return state
+
+
 def _executable_catalog_keys(catalog: Mapping[str, int | str]) -> tuple[str, ...]:
     keys: list[str] = []
     for key, platform_id in catalog.items():
@@ -161,17 +221,24 @@ _ORDINARY_RECALL_KEYS = frozenset({"today", "verbatim", "correction"})
 # 2026-09-17 改成 18000，理由是**单位变了**：用户点名的单位是「一天/一个时段」，
 # 而 2026-09-17 的覆盖修复把长夜切成多段（一夜 4 段、每段约 4,400 token），于是
 # 8000 只装得下这一段里的**最新一块**——真机上他要核对的那句在第三块，永远进不来，
-# 她只能说「我这儿翻不着」（历史诊断 §7）。18000 够装下这样的
+# 她只能说「我这儿翻不着」（doc/诊断-20260917-明细截断.md §7）。18000 够装下这样的
 # 一整天；仍然装不下时，照旧把「更早的 N 条没有展开」写成事实，不假装完整。
 # 排序（fragments_ranked_by_text）在同一天片段多于预算时才起作用。回退：改回 8000。
 _DETAIL_TOKEN_BUDGET = 18000
 
-# 2026-09-18 呈现层（历史方案 §5 方案 A，用户裁定 N=3）：
+# 2026-09-18 呈现层（doc/方案-20260918-常驻记忆与主动提起.md §5 方案 A，用户裁定 N=3）：
 # 常驻三条「她自己记着的事」。**只放 episode**——实测按重要性排出来的全是 preference
 # （对她的行为约束），常驻它们等于每轮提醒她该怎样，正是用户最怕的记账化。
 # 硬边界：ordinary + daily_safe（成人/亲密内容一律不进常驻层，延续 09-14 裁定）。
 # 排序按时间倒序（近的在前），不用 importance。回退：把常量改成 0 即可。
-_PINNED_EPISODE_LIMIT = 3
+# 2026-09-22 用户裁定：**不再把 episode 钉进常驻层**。
+# 他看维护面板时指出「后三条很明显不该在最近的对话里挂着」——那三条正是这里钉的
+# 「最新三条 ordinary+daily_safe episode」（9-20 看 CS 决赛、9-20 养活自己、9-21 兔子图），
+# 都是**已经过去的时点事件**，却每轮都挂在「偏好与约定」那一块里，连面板标题都名不副实。
+# 取 0 即关闭：episode 仍然照旧留在工作集里（紧凑行），只是不再额外钉三条进常驻层。
+# 更早的顾虑（2026-09-18「记下来了不会自己提」）由工作集里的 episode 承担——
+# 关闭前后都要用「我最近都在忙些什么」副本对照确认没掉回忆。
+_PINNED_EPISODE_LIMIT = 0
 # 点名一天时最多取那天的几段（最新的优先）。真正的裁剪交给 token 预算，这里只
 # 防止一天里片段太多时把另一天挤光。
 _DAY_FRAGMENT_LIMIT = 8
@@ -297,7 +364,7 @@ def _advance_image_carry(
 
     返回（这一轮要挂的图，图的来源事件 id）。**新图轮的来源就是本轮**（调用方手上已经有它），
     所以只有宽限重挂才回一个 id——那一轮必须把「这是更早那条里的同一张」说出来，否则一张
-    没有来由的图会被读成「他又发了一张」（2026-09-16 真机，见历史诊断）。
+    没有来由的图会被读成「他又发了一张」（2026-09-16 真机，见 doc/诊断-20260916-图片重挂.md）。
     """
 
     if fresh:
@@ -357,6 +424,8 @@ class G0Application:
         initiative_thinking: str = "disabled",
         auto_quote_current_message: bool = False,
         always_include_memory_types: tuple[str, ...] = ("agreement", "correction"),
+        # 卡B④：episode 在常驻层的年龄上限（天）。0 = 不按年龄退场。
+        working_set_episode_max_age_days: int = 14,
         memory_candidate_limit: int = 24,
         memory_context_limit: int = 12,
         local_zone: tzinfo | None = None,
@@ -405,6 +474,12 @@ class G0Application:
             or len(set(always_include_memory_types)) != len(always_include_memory_types)
         ):
             raise TypeError("always_include_memory_types must be a tuple of unique non-empty strings")
+        if (
+            isinstance(working_set_episode_max_age_days, bool)
+            or not isinstance(working_set_episode_max_age_days, int)
+            or working_set_episode_max_age_days < 0
+        ):
+            raise ValueError("working_set_episode_max_age_days must be a non-negative integer")
 
         self.database = database
         self.owner_qq = _decimal_id(owner_qq, "owner_qq")
@@ -441,6 +516,7 @@ class G0Application:
         self._turn_tool_usage: dict[str, dict[str, Any]] = {}
         self.auto_quote_current_message = auto_quote_current_message
         self.always_include_memory_types = always_include_memory_types
+        self.working_set_episode_max_age_days = working_set_episode_max_age_days
         self.quotes = QuoteResolver(database)
         self.sender = Sender(
             database,
@@ -479,6 +555,9 @@ class G0Application:
         # 上一轮真的摊开过哪些片段（T6 的改口路径要它）：只活在进程内存里，
         # 重启后为空，那也只是回到「没有可改口的上文」。
         self._last_detail_fragments: dict[str, tuple[str, ...]] = {}
+        # 2026-09-20 共同想象场景状态：和上面一样只活在进程内存里（不落库的理由见
+        # _SceneMarks 的说明）。只记状态、只注入事实，不做任何语义判断。
+        self._scene_marks = _SceneMarks()
 
     async def handle_onebot(
         self,
@@ -602,6 +681,7 @@ class G0Application:
                     await self._emit_failure_notice(persisted, "dialogue:invalid_result")
                     _LOGGER.error("dialogue engine returned an invalid outcome")
                     return None
+                self._apply_scene_mark(outcome, persisted.conversation_id)
                 self._record_generation_trace(
                     persisted,
                     source,
@@ -683,6 +763,7 @@ class G0Application:
                         voice_part=voice_part,
                         parts=reply_parts,
                         voice_index=outcome.voice_part_index,
+                        source=source,
                     )
                     if spoken_event is not None:
                         self._response_observations.pop(persisted.event_id, None)
@@ -716,6 +797,7 @@ class G0Application:
                         part_text=voice_part[2],
                         parts=reply_parts,
                         voice_index=outcome.voice_part_index,
+                        source=source,
                     )
                 return delivered
         finally:
@@ -769,10 +851,12 @@ class G0Application:
         parts: tuple[str, ...] | None = None,
         voice_index: int | None = None,
         initiative: bool = False,
+        source: str = "dialogue",
     ) -> Any:
         from qichi.voice.dispatch import VoiceJob
 
         return VoiceJob(
+            source=source,
             group_event_id=group_event_id,
             event_id=Sender.voice_part_event_id(group_event_id, part_index),
             part_index=part_index,
@@ -797,6 +881,7 @@ class G0Application:
         parts: tuple[str, ...] | None = None,
         voice_index: int | None = None,
         initiative: bool = False,
+        source: str = "dialogue",
     ) -> None:
         """文字组发完之后才把语音交给后台 —— 绝不阻塞文字回复（用户硬要求）。"""
 
@@ -809,6 +894,7 @@ class G0Application:
             parts=parts,
             voice_index=voice_index,
             initiative=initiative,
+            source=source,
         )
         task = asyncio.get_running_loop().create_task(self._deliver_voice(job))
         self._voice_tasks.add(task)
@@ -823,6 +909,7 @@ class G0Application:
         parts: tuple[str, ...] | None = None,
         voice_index: int | None = None,
         initiative: bool = False,
+        source: str = "dialogue",
     ) -> ConversationEvent | None:
         """整轮只有语音：不发文字组，就地等这一句说完（用户 2026-09-14 裁定）。
 
@@ -842,6 +929,7 @@ class G0Application:
             parts=parts,
             voice_index=voice_index,
             initiative=initiative,
+            source=source,
         )
         result = await self._deliver_voice(job)
         if result is None:
@@ -1135,6 +1223,7 @@ class G0Application:
                     },
                 )
                 raise TypeError("initiative engine must return a dialogue outcome")
+            self._apply_scene_mark(outcome, conversation_id)
             self._record_generation_trace(
                 initiative_event,
                 "initiative",
@@ -1256,6 +1345,7 @@ class G0Application:
                     parts=reply_parts,
                     voice_index=getattr(outcome, "voice_part_index", None),
                     initiative=True,
+                    source="initiative",
                 )
                 if spoken_event is not None:
                     with self.database.connection:
@@ -1308,6 +1398,7 @@ class G0Application:
                     parts=reply_parts,
                     voice_index=getattr(outcome, "voice_part_index", None),
                     initiative=True,
+                    source="initiative",
                 )
             return delivered
 
@@ -1507,6 +1598,9 @@ class G0Application:
                     segment.type == "image" for segment in event.message_segments
                 )
                 break
+        # 卡⑥ 2026-09-21：这一轮的状态事实有没有注入，同时记进 trace。
+        # 以前它只活在进程内存，事后在事件元数据/trace/outbox 三处都查不到。
+        scene_active = self._scene_marks.is_active(current.conversation_id, now=now)
         facts = RuntimeFacts(
             current_time=now,
             seconds_since_last_message=seconds_since_last,
@@ -1550,6 +1644,8 @@ class G0Application:
             # （宽限窗口内像素一直在手上）——两句事实不能互相打架，重挂那一轮由上面那行说话。
             previous_image_message=previous_image_message and not carried_count,
             external_tools_available=False,
+            # 状态过期由仓储按 TTL 判定：她标记 on 之后一直没再标记，就不算还在场景里。
+            scene_active=scene_active,
             initiative_attempt=source == "initiative",
             initiative_attempt_index=initiative_attempt_index,
             initiative_previous_at=initiative_previous_at,
@@ -1610,6 +1706,29 @@ class G0Application:
             if record.type in self.always_include_memory_types
         ) + self._remembered_episodes(context_active_memories)
         relationship_ids = {record.memory_id for record in relationship_state}
+        # 卡② 2026-09-21 分层渲染：同一份记忆不重复渲染；同一层里只留「类型标记 + 逐字事实」。
+        #   - agreement / correction 已在 relationship_state 里带证据完整渲染 → 不重复进工作集
+        #   - episode **仍然常驻**，只换成紧凑行。曾试过把它整段移出常驻层（只留
+        #     _remembered_episodes 钉的三条），副本对照暴露回归：问「我最近都在忙些什么」，
+        #     那次回答只剩「我这边其实只有个大概」，而保留 episode 的采样能数出团建/校区/文档AI。
+        #     那正是用户当年抱怨过的「记下来了不会自己提」。所以 episode 不走，只压缩。
+        # 卡B④（2026-09-22 用户裁定）：常驻层加一道年龄门，只有 episode 会因年龄退场。
+        #   - 偏好、约定、纠正是常驻关系状态（AGENTS.md 冻结不变式），再老也不退；
+        #   - episode 退的是「常驻」，不是删除：记录、证据、索引都还在，仍可被检索
+        #     按相关度带回来。所以判错一条的代价是「这轮不在场」，不是「她永远忘了」；
+        #   - 之所以不按类型踢掉 episode：2026-09-21 的副本对照证明整段移出会让
+        #     「我最近都在忙些什么」答不出团建/校区/文档AI（见上面那段注释），
+        #     而那次回归针对的是「近期经历」——近的留着，只有旧的退场。
+        working_set_memories = tuple(
+            record
+            for record in context_active_memories
+            if record.type not in self.always_include_memory_types
+            and working_set_resident(
+                record,
+                now,
+                episode_max_age_days=self.working_set_episode_max_age_days,
+            )
+        )
         memory_candidates = tuple(
             record
             for record in retrieved.context_candidates
@@ -1788,7 +1907,7 @@ class G0Application:
                 quoted_chain=quoted_chain,
                 recent_events=history,
                 relationship_state=relationship_state,
-                memory_working_set=context_active_memories,
+                memory_working_set=working_set_memories,
                 memory_candidates=tuple(record for record in memory_candidates if record.status == "active"),
                 confirmation_candidates=confirmation,
                 earlier_events=(),
@@ -1810,7 +1929,7 @@ class G0Application:
             built = self.context_builder.build(ContextBuildRequest(
                 role_core=self.role_core, runtime_facts=facts, current_event=current,
                 quoted_chain=quoted_chain, recent_events=history,
-                relationship_state=relationship_state, memory_working_set=context_active_memories,
+                relationship_state=relationship_state, memory_working_set=working_set_memories,
                 memory_candidates=memory_candidates,
                 confirmation_candidates=(), earlier_events=(), evidence_events=evidence_events,
                 memory_details=memory_details,
@@ -1835,7 +1954,7 @@ class G0Application:
                 built = self.context_builder.build(ContextBuildRequest(
                     role_core=self.role_core, runtime_facts=facts, current_event=current,
                     quoted_chain=quoted_chain, recent_events=history,
-                    relationship_state=relationship_state, memory_working_set=context_active_memories,
+                    relationship_state=relationship_state, memory_working_set=working_set_memories,
                     memory_candidates=memory_candidates,
                     confirmation_candidates=(), earlier_events=(), evidence_events=evidence_events,
                     memory_details=memory_details,
@@ -1859,7 +1978,17 @@ class G0Application:
                 "input_tokens": built.metrics.input_tokens,
                 "input_budget_tokens": built.metrics.input_budget_tokens,
                 "window_tokens": built.metrics.window_tokens,
+                # 2026-09-22 成本观测：本轮提示字符数与"与上一轮的公共前缀"字符数
+                # （只有数字）。与 generation trace 的 cache_hit_tokens 并排对照，
+                # 用来判定命中偏低是提示结构问题还是供应商侧的命中判定差异。
+                "prompt_chars": built.metrics.prompt_chars,
+                "prompt_prefix_chars": built.metrics.prompt_prefix_chars,
+                # DeepSeek 的缓存前缀单元落在"请求输入结束位置"；完整覆盖上一轮全部提示时，
+                # 命中至少应达到上一轮的输入 tokens。这条是那条规则的直接可验证预测。
+                "prompt_covers_previous": built.metrics.prompt_covers_previous,
                 "expanded": built.metrics.expanded,
+                # 卡⑥：这一轮有没有注入场景状态行（她自己标记的状态事实）。
+                "scene_active": scene_active,
                 "category_tokens": dict(built.metrics.category_tokens),
                 "omitted_counts": dict(built.metrics.omitted_counts),
                 "selected_history_event_ids": list(built.metrics.selected_history_event_ids),
@@ -2025,6 +2154,18 @@ class G0Application:
             raise TypeError("generate_with_observation returned an invalid contract")
         return value
 
+    def _apply_scene_mark(self, outcome: DialogueOutcome, conversation_id: str) -> None:
+        """把她在这一轮里标记的场景状态记进进程内存（on → 开始，off → 结束）。
+
+        代码只记录状态，不解读语义、不解析用户的文本；只活在内存里，见 _SceneMarks。
+        取值在协议层已经校验过（只可能是 on/off），所以这里没有失败分支要处理。
+        """
+
+        mark = getattr(outcome, "scene_mark", None)
+        if mark is None:
+            return
+        self._scene_marks.apply(conversation_id, mark, now=_aware_utc(self._clock(), "clock result"))
+
     def _remembered_episodes(
         self, records: tuple[MemoryRecord, ...]
     ) -> tuple[MemoryRecord, ...]:
@@ -2057,7 +2198,7 @@ class G0Application:
     ) -> "_EpisodePointer":
         """Which episode does this turn point at, and with which key?
 
-        2026-09-12 T2（历史修复计划 §2.1）。授权与定位
+        2026-09-12 T2（doc/修复计划-20260912-记忆展开与识图.md §2.1）。授权与定位
         从这一版开始分开：这里只回答「有没有指，用什么指的」，_detail_targets 回答
         「指到哪一段」。三字窗口命中**不再是钥匙**——它只说明「像」，不说明「你要」，
         而正是它让两个字（"不够"）打开了 32 条成人原文（问题冻结 P1）。
@@ -2073,6 +2214,17 @@ class G0Application:
         # 的更正等于没说）。今天只拿到普通明细的权限，过去的日子照旧。
         past_days = _past_days(days, today)
         today_named = any(day == today for day in days) and names_a_time_of_day(text)
+        # 卡D（2026-09-22 用户裁定，真机缺口）：只指时段/钟点、没提"今天"时，只要那一段
+        # **今天已经过去**，就同样是在指今天。真机原话「是早上还是中午来着，应该在十点
+        # 到十一点附近我找的你来着」此前 referenced_dates 为空 → 指针落 none → 展开从未
+        # 被尝试，她只能说"真翻不到"；而库里那段材料是有的（fb0526b9/36f4d511）。
+        if text and not past_days and not today_named:
+            implied = referenced_past_segment(text, now=now, local_zone=self.local_zone)
+            if implied is not None:
+                if implied >= today:
+                    today_named = True      # 隐含就是今天
+                else:
+                    past_days = past_days + (implied,)   # 隐含是昨天（凌晨说早上）
         if past_days or today_named:
             wanted = past_days + ((today,) if today_named else ())
             # 时段词参与选片段：点「凌晨」就先给凌晨那几段（T10）。
@@ -2414,6 +2566,8 @@ class G0Application:
         if isinstance(outcome, DialogueResult):
             details.update(
                 {
+                    # 卡⑥：她这一轮标了什么（on / off / None）。代码只记录，不解读。
+                    "scene_mark": outcome.scene_mark,
                     "message_part_count": len(outcome.message_parts),
                     "reply_target_handle": outcome.reply_target,
                     "expression_kind": (

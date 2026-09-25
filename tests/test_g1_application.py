@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 import json
 
 import pytest
@@ -100,8 +99,6 @@ def app(database, llm, napcat, worker=None, clock=lambda: NOW):
     return G0Application(
         database, builder(), engine, napcat, owner_qq=OWNER, bot_qq=BOT,
         role_core="你是角色。", clock=clock, memory_worker=worker,
-        # 夹具时钟固定在 +08:00；显式给时区，测试就不再看运行机器的时区。
-        local_zone=ZoneInfo("Asia/Shanghai"),
     )
 
 
@@ -164,6 +161,17 @@ def seed_relationships(database):
                 certainty="unsupported", importance=0, temporal_scope="unclassified", reason="unsupported_or_transient")
     seed_memory(memories, "self", qichi_source, "角色表达过在意用户", "很在意用户", type="self_expression")
 
+
+def test_the_resident_layer_no_longer_pins_episodes():
+    """2026-09-22 用户裁定：常驻层不再钉 episode（他在面板看到的「后三条」就是它钉的）。
+
+    那三条是「最新三条 ordinary+daily_safe episode」，都是已经过去的时点事件，却每轮
+    挂在标题写着「偏好与约定」的那块里。取 0 即关闭；episode 仍留在工作集里。
+    """
+
+    from qichi.app import _PINNED_EPISODE_LIMIT
+
+    assert _PINNED_EPISODE_LIMIT == 0, "钉住最新三条 episode 的开关必须归零"
 
 def test_recent_history_starts_after_a_real_long_gap(tmp_path):
     database = Database(tmp_path / "session-history.sqlite3")
@@ -259,7 +267,8 @@ async def test_second_round_reads_relationships_retrieval_and_notifies_reliable_
         prompt = "\n".join(message.content for message in llm.calls[1])
         assert len(llm.calls) == 2
         assert "[关系记忆工作集 |" in prompt
-        assert "memory_id=preference" in prompt
+        # 卡①：工作集行不再带 memory_id，改用事实正文证明「它常驻但不是过去背景」。
+        assert "- [preference] 用户喜欢雨声" in prompt
         assert "[过去背景 | memory_id=preference" not in prompt
         assert "memory_id=agreement" in prompt and "status=active" in prompt
         assert "[用户已确认 | memory_id=correction; type=correction; status=active]" in prompt
@@ -285,7 +294,7 @@ async def test_preference_memory_is_globally_discoverable_but_only_topic_retriev
         assert "memory_id=agreement" in unrelated_prompt
         assert "memory_id=correction" in unrelated_prompt
         assert "[关系记忆工作集 |" in unrelated_prompt
-        assert "memory_id=preference" in unrelated_prompt
+        assert "- [preference] 用户喜欢雨声" in unrelated_prompt
         assert "[过去背景 | memory_id=preference" not in unrelated_prompt
 
         await application.handle_onebot(

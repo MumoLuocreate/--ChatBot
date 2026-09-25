@@ -171,7 +171,13 @@ def test_pipeline_still_injects_an_ordinary_memory_on_a_topic_hit(tmp_path):
     try:
         application = app(database, FakeLLM(["回复"]), FakeNapCat())
         assert "ordinary-memory" in _retrieved(application, "便利店的关东煮好吃吗")
-        assert ORDINARY_QUOTE in _turn(application, events, "便利店的关东煮好吃吗", "c1")
+        # 卡② 2026-09-21：普通 episode 现在只走常驻关系状态（fact-only，见 _render_remembered），
+        # 不再在 working set 里重复渲染一份「带原话」的副本。所以判「内容进来了」用归一事实做
+        # 标记，不再用原话；原话由「最近原文足迹」和检索那两条路承担。
+        rendered = _turn(application, events, "便利店的关东煮好吃吗", "c1")
+        assert "喜欢便利店的关东煮" in rendered, "普通记忆必须仍然进得来"
+        assert ORDINARY_QUOTE in rendered, "普通记忆的原话仍然随常驻行一起进来"
+        assert ADULT_QUOTE not in rendered, "成人原话不得因此漏进来"
     finally:
         database.close()
 

@@ -160,7 +160,7 @@ def request(**overrides) -> ContextBuildRequest:
 
 
 def test_adult_memory_is_hidden_from_daily_context_but_available_when_topic_is_in_scope():
-    source = event(19, "mumo", "昨晚我们明确进入过那个场景，具体方式以这条原话为准")
+    source = event(19, "mumo", "昨晚我们明确玩过强势的成人互动，具体方式以这条原话为准")
     current = event(20, "mumo", "今天陪我聊聊工作")
     sensitive = memory(
         "adult-episode",
@@ -525,10 +525,10 @@ def test_memory_candidates_are_capped_at_twelve_and_require_active_evidence():
 
 
 def test_active_memory_working_set_is_compact_ranked_background_not_detailed_evidence():
-    low_source = event(1, "mumo", "偶尔想听两句好听的")
-    high_source = event(2, "mumo", "不要在我还想聊的时候让我先去睡")
+    low_source = event(1, "mumo", "偶尔想被哄一下")
+    high_source = event(2, "mumo", "不要在我还想聊天时赶我睡觉")
     low = replace(
-        memory("low", low_source, type="preference", fact="用户偶尔想听两句好听的"),
+        memory("low", low_source, type="preference", fact="用户偶尔想被哄一下"),
         certainty="explicit",
         importance=2,
         temporal_scope="ongoing",
@@ -536,7 +536,7 @@ def test_active_memory_working_set_is_compact_ranked_background_not_detailed_evi
         assessed_at_utc=low_source.occurred_at_utc,
     )
     high = replace(
-        memory("high", high_source, type="agreement", fact="用户还想聊的时候不要让他先去睡"),
+        memory("high", high_source, type="agreement", fact="用户还想聊天时不要赶他睡觉"),
         certainty="explicit",
         importance=3,
         temporal_scope="ongoing",
@@ -556,15 +556,42 @@ def test_active_memory_working_set_is_compact_ranked_background_not_detailed_evi
     text = joined(result)
 
     assert text.count("[关系记忆工作集 |") == 1
-    assert text.index("memory_id=high") < text.index("memory_id=low")
-    assert "importance=3" in text and "importance=2" in text
-    assert "certainty=explicit" in text and "temporal_scope=ongoing" in text
-    assert "用户还想聊的时候不要让他先去睡" in text
-    assert "用户偶尔想听两句好听的" in text
+    # 卡① 2026-09-21：工作集行不再带 memory_id，排序探针改用事实正文（意图不变）。
+    assert text.index("用户还想聊天时不要赶他睡觉") < text.index("用户偶尔想被哄一下")
+    # 卡② 2026-09-21：工作集行收敛成「类型标记 + 逐字事实」，台账字段一概不写。
+    assert "- [agreement] 用户还想聊天时不要赶他睡觉" in text
+    assert "- [preference] 用户偶尔想被哄一下" in text
+    assert "memory_id=" not in text
+    assert "importance=" not in text and "certainty=" not in text
+    assert "temporal_scope=" not in text and "privacy=" not in text and "recall=" not in text
     assert "exact_quote=" not in text
     assert "[过去背景 | memory_id=low" not in text
     assert result.metrics.selected_working_memory_ids == ("high", "low")
     assert result.metrics.selected_memory_ids == ()
+
+
+def test_the_prompt_prefix_is_measured_per_turn_and_carries_no_text():
+    """命中（2026-09-22 成本）：相邻两轮要报出「与上一轮的公共前缀」字符数。
+
+    真机缓存命中只有 28%，而离线测得相邻两轮的公共前缀有 67~70%——把这两个数字
+    与 cache_hit_tokens 并排记，才能判定差额来自提示结构还是供应商侧的命中判定。
+    这里同时锁死：第一轮没有可比对象（0）、逐轮递增且不超过本轮长度、**只有数字**。
+    """
+
+    instance = builder(preferred=30, maximum=30, reserve=1, provider_tokens=30)
+
+    first = instance.build(request())
+    second = instance.build(request())
+
+    assert first.metrics.prompt_chars > 0
+    assert first.metrics.prompt_prefix_chars == 0, "第一轮没有上一轮可比"
+    assert second.metrics.prompt_prefix_chars > 0, "同一会话相邻两轮必须有公共前缀"
+    assert second.metrics.prompt_prefix_chars <= second.metrics.prompt_chars
+    assert type(second.metrics.prompt_prefix_chars) is int, "只记数字，不落正文"
+    assert "你是角色" not in str(second.metrics.prompt_prefix_chars)
+    # DeepSeek 的单元落在"请求输入结束位置"：后面这轮是否完整覆盖了上一轮的整段提示，
+    # 是"至少应命中上一轮输入 tokens"的直接前提。
+    assert type(second.metrics.prompt_covers_previous) is bool
 
 
 def test_memory_working_set_rejects_inactive_or_unresolved_records_and_never_blocks_current():
@@ -635,7 +662,7 @@ def test_qichi_evidence_is_not_labeled_as_a_confirmed_mumo_fact():
 def test_an_episode_is_rendered_as_a_plain_remembered_line():
     """2026-09-18 呈现层：常驻的 episode 只写一行归一事实，不带台账字段，并附边界说明。"""
 
-    source = event(1, "mumo", "那块板子能接屏幕")
+    source = event(1, "mumo", "校区那块板子能搭屏幕")
     record = memory("episode-1", source, type="episode")
 
     result = builder().build(
@@ -721,7 +748,7 @@ def test_repeated_recent_emoji_is_exposed_as_a_neutral_fact_without_selecting_a_
     assert "近期表情使用统计" in text
     assert "😌=2" in text
     assert "不代表当前表达选择" in text
-    # 历史架构设计 18.3：这条统计要提醒「可以省略、不必机械复用」；但仍然不指定替代。
+    # doc/新架构设计.md 18.3：这条统计要提醒「可以省略、不必机械复用」；但仍然不指定替代。
     assert "表情可以省略" in text
     assert "同一个也不必机械复用" in text
     assert "😊" not in text and "换一个" not in text, "统计不指定替代表情"
@@ -730,7 +757,7 @@ def test_repeated_recent_emoji_is_exposed_as_a_neutral_fact_without_selecting_a_
 def test_a_repeated_kaomoji_is_counted_as_one_expression_token():
     """2026-09-14 真机：她整晚只用 (￣▽￣) 41 次，而统计块看不见它（￣ 和 ▽ 是普通字符）。"""
 
-    first = event(1, "qichi", "行啊，就按你说的(￣▽￣)")
+    first = event(1, "qichi", "扣钱钱？行啊(￣▽￣)")
     second = event(2, "qichi", "这点我不认(￣▽￣)")
     third = event(3, "qichi", "那就这样(￣▽￣)")
     current = event(4, "mumo", "继续", at=BASE + timedelta(minutes=4))
@@ -758,11 +785,11 @@ def test_one_kaomoji_alone_is_ordinary_wording():
 
 
 def test_parentheses_with_words_are_not_expression_tokens():
-    """（纸鸢）这种普通括号不是表情；混了汉字的括号也不算。"""
+    """（垂耳兔）这种普通括号不是表情；混了汉字的括号也不算。"""
 
     events = (
-        event(1, "qichi", "我形象是一只纸鸢（纸鸢）"),
-        event(2, "qichi", "（这就是那只 ￣▽￣ 纸鸢）"),
+        event(1, "qichi", "我形象是垂耳兔（垂耳兔）"),
+        event(2, "qichi", "（这就是那只 ￣▽￣ 兔子）"),
     )
     current = event(3, "mumo", "继续", at=BASE + timedelta(minutes=3))
 
@@ -870,16 +897,23 @@ def test_metrics_contain_counts_and_ids_but_not_prompt_text():
 def test_real_character_counter_never_exceeds_input_budget():
     current = event(2, "mumo", "当前消息")
     context_builder = builder(
-        preferred=1000,
-        maximum=1000,
+        preferred=1100,
+        maximum=1100,
         reserve=50,
-        provider_tokens=1000,
+        provider_tokens=2000,
         counter=CharacterTokenCounter(),
     )
     result = context_builder.build(request(current_event=current))
 
     assert result.metrics.input_tokens == sum(len(message.content) for message in result.messages)
-    assert result.metrics.input_tokens <= 950
+    # 2026-09-20 预算账（常驻最小信封 = 角色核心 + 稳定半 + 本轮半 + 当前输入）：
+    #   实测 1018 字，其中 75 字是 [[qq:scene:on]] / [[qq:scene:off]] 的目录条目；
+    #   守卫线 = window − reserve = 1100 − 50 = 1050，**余量 32 字**。
+    # 窗口原来是 1000（守卫线 950），而那个目录条目让常驻信封从 943 长到 1018——
+    # 1000 字窗口在物理上装不下必需要素，builder 会（正确地）fail closed，所以窗口抬到 1100。
+    # 测试原意不变：builder 绝不静默超过 input_budget。
+    # **这 32 字不是可用空间**：以后每加一句常驻文本都要重新看这个数。
+    assert result.metrics.input_tokens <= 1050
 
 
 def vision_builder(**overrides):
