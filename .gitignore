@@ -24,3 +24,7 @@ backups/
 .pytest-tmp-*/
 _tmp/
 doc/运行时角色核心.md
+
+*.egg-info/
+build/
+dist/
