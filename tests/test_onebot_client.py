@@ -104,17 +104,25 @@ def test_action_failure_categories(response, error_type):
 def test_action_timeout_and_connection_failures_do_not_retry():
     async def scenario():
         calls = 0
+        arrived = asyncio.Event()
+        release = asyncio.Event()
 
         async def actions(_: web.Request):
             nonlocal calls
             calls += 1
-            await asyncio.sleep(0.1)
+            arrived.set()
+            await release.wait()
             return web.json_response({"status": "ok", "retcode": 0, "data": {}})
 
         async with fake_onebot(actions, close_ws) as (http_url, ws_url):
-            async with OneBotClient(http_url, ws_url, "secret-token", timeout=0.01) as client:
+            async with OneBotClient(http_url, ws_url, "secret-token", timeout=0.5) as client:
+                # 先等请求真的到达服务端，再等客户端超时。原来 timeout=0.01 会与本地
+                # 投递赛跑：3.11 的 CI runner 上出现过一次都没到（calls == 0）。
+                pending = asyncio.create_task(client.send_poke(42))
+                await asyncio.wait_for(arrived.wait(), timeout=5)
                 with pytest.raises(OneBotTimeoutError):
-                    await client.send_poke(42)
+                    await pending
+            release.set()
         assert calls == 1
 
         async def disconnect(request: web.Request):
