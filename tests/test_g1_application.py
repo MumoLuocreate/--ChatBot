@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import json
 
 import pytest
@@ -23,6 +24,9 @@ from qichi.transport.onebot_client import OneBotActionError, OneBotTimeoutError
 
 NOW = datetime(2026, 8, 28, 2, 0, tzinfo=timezone.utc)
 OWNER = "10001"
+# 测试里的「本地」一律指上海：显式钉住时区，否则在 UTC runner 上
+# 「今天凌晨/零点过后」这类分桶会因为环境时区不同而改变结果。
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 BOT = "20001"
 
 
@@ -98,7 +102,7 @@ def app(database, llm, napcat, worker=None, clock=lambda: NOW):
                             ResponseProtocol(face_keys=(), reaction_keys=()))
     return G0Application(
         database, builder(), engine, napcat, owner_qq=OWNER, bot_qq=BOT,
-        role_core="你是角色。", clock=clock, memory_worker=worker,
+        role_core="你是角色。", clock=clock, local_zone=SHANGHAI, memory_worker=worker,
     )
 
 
