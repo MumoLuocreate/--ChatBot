@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Iterable, Literal, Mapping, TypeAlias
@@ -39,8 +39,8 @@ class MemoryRetrievalResult:
     evidence_events: Mapping[str, ConversationEvent]
     search_mode: SearchMode
     degraded_reason: str | None
-    scores: Mapping[str, int] = MappingProxyType({})
-    reasons: Mapping[str, str] = MappingProxyType({})
+    scores: Mapping[str, int] = field(default_factory=lambda: MappingProxyType({}))
+    reasons: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     confirmation_candidates: tuple[MemoryRecord, ...] = ()
 
     def __post_init__(self) -> None:
